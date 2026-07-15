@@ -1,5 +1,6 @@
 use codex_quota_ball::quota::{
-    format_reset_time, parse_quota_response, remaining_percent, ring_tone, RingTone,
+    format_reset_time, parse_quota_response, remaining_percent, ring_tone, weekly_window,
+    QuotaSnapshot, QuotaWindow, RingTone,
 };
 use serde_json::json;
 
@@ -58,17 +59,61 @@ fn prefers_the_codex_multi_bucket_when_present() {
 }
 
 #[test]
-fn permits_a_missing_secondary_but_rejects_missing_primary() {
-    let primary_only = json!({"result":{"rateLimits":{"primary":{"usedPercent":10}}}});
-    assert!(parse_quota_response(&primary_only)
-        .unwrap()
-        .secondary
-        .is_none());
-    let missing = json!({"result":{"rateLimits":{"secondary":{"usedPercent":10}}}});
+fn weekly_selection_uses_longest_window_and_prefers_secondary_on_ties() {
+    let primary = QuotaWindow {
+        remaining_percent: 80,
+        resets_at: None,
+        window_duration_mins: Some(300),
+    };
+    let secondary = QuotaWindow {
+        remaining_percent: 55,
+        resets_at: None,
+        window_duration_mins: Some(10080),
+    };
+    let snapshot = QuotaSnapshot {
+        primary: Some(primary),
+        secondary: Some(secondary.clone()),
+    };
+    assert_eq!(weekly_window(&snapshot), Some(&secondary));
+
+    let missing_durations = QuotaSnapshot {
+        primary: Some(QuotaWindow {
+            remaining_percent: 70,
+            resets_at: None,
+            window_duration_mins: None,
+        }),
+        secondary: Some(QuotaWindow {
+            remaining_percent: 60,
+            resets_at: None,
+            window_duration_mins: None,
+        }),
+    };
     assert_eq!(
-        parse_quota_response(&missing).unwrap_err().to_string(),
-        "primary quota is unavailable"
+        weekly_window(&missing_durations).unwrap().remaining_percent,
+        60
     );
+}
+
+#[test]
+fn quota_parser_accepts_either_single_window_but_rejects_no_windows() {
+    let secondary_only = parse_quota_response(&json!({
+        "result": {
+            "rateLimits": {
+                "primary": null,
+                "secondary": {"usedPercent": 40, "windowDurationMins": 10080}
+            }
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        weekly_window(&secondary_only).unwrap().remaining_percent,
+        60
+    );
+
+    assert!(parse_quota_response(&json!({
+        "result": {"rateLimits": {"primary": null, "secondary": null}}
+    }))
+    .is_err());
 }
 
 #[test]

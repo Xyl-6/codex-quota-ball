@@ -69,6 +69,23 @@ pub fn format_reset_time(timestamp: Option<i64>) -> String {
         .unwrap_or_else(|| "不可用".to_owned())
 }
 
+pub fn weekly_window(snapshot: &QuotaSnapshot) -> Option<&QuotaWindow> {
+    match (&snapshot.primary, &snapshot.secondary) {
+        (None, None) => None,
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (Some(primary), Some(secondary)) => {
+            let primary_duration = primary.window_duration_mins.unwrap_or(i64::MIN);
+            let secondary_duration = secondary.window_duration_mins.unwrap_or(i64::MIN);
+            if secondary_duration >= primary_duration {
+                Some(secondary)
+            } else {
+                Some(primary)
+            }
+        }
+    }
+}
+
 pub fn parse_quota_response(value: &Value) -> Result<QuotaSnapshot, QuotaParseError> {
     let result = value
         .get("result")
@@ -80,8 +97,8 @@ pub fn parse_quota_response(value: &Value) -> Result<QuotaSnapshot, QuotaParseEr
         .ok_or(QuotaParseError("response has no rate limits"))?;
     let wire: SnapshotWire = serde_json::from_value(bucket.clone())
         .map_err(|_| QuotaParseError("rate-limit response is incompatible"))?;
-    if wire.primary.is_none() {
-        return Err(QuotaParseError("primary quota is unavailable"));
+    if wire.primary.is_none() && wire.secondary.is_none() {
+        return Err(QuotaParseError("quota is unavailable"));
     }
     let convert = |window: WindowWire| QuotaWindow {
         remaining_percent: remaining_percent(window.used_percent),

@@ -3,5 +3,6 @@ pub mod config;
 pub mod fonts;
 pub mod quota;
 pub mod ui;
+pub mod usage;
 pub mod worker;
 pub mod x11;
