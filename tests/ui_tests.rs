@@ -1,8 +1,8 @@
 use codex_quota_ball::{
     config::Position,
     ui::{
-        compact_anchor_from_viewport, concise_error, expanded_layout, ring_points, window_size,
-        PositionSettleTracker, BALL_SIZE, CARD_WIDTH, EXPANDED_SIZE,
+        compact_anchor_from_viewport, concise_error, expanded_layout, reflow_expanded_drag,
+        ring_points, window_size, PositionSettleTracker, BALL_SIZE, CARD_WIDTH, EXPANDED_SIZE,
     },
     x11::{
         clamp_to_bounds, clamp_to_known_bounds, parse_workarea_rects, resolve_workareas,
@@ -104,6 +104,76 @@ fn expanded_then_compact_restores_original_anchor() {
             anchor
         );
     }
+}
+
+#[test]
+fn expanded_drag_reflows_at_all_edges_and_across_monitors() {
+    let workareas = [
+        Bounds {
+            x: -1920,
+            y: 24,
+            width: 1920,
+            height: 1056,
+        },
+        Bounds {
+            x: 0,
+            y: 24,
+            width: 1920,
+            height: 1056,
+        },
+    ];
+    let current_ball_offset = Position { x: 0, y: 0 };
+    let anchors = [
+        Position { x: -1920, y: 24 },
+        Position { x: -88, y: 24 },
+        Position { x: 0, y: 992 },
+        Position { x: 1832, y: 992 },
+    ];
+
+    for anchor in anchors {
+        let placement = reflow_expanded_drag(anchor, current_ball_offset, &workareas, 1).unwrap();
+        assert_eq!(placement.compact_anchor, anchor);
+        let selected = select_bounds(&workareas, 1, anchor).unwrap();
+        let origin = placement.layout.viewport_origin;
+        assert!(origin.x >= selected.x);
+        assert!(origin.y >= selected.y);
+        assert!(origin.x + EXPANDED_SIZE.x as i32 <= selected.x + selected.width);
+        assert!(origin.y + EXPANDED_SIZE.y as i32 <= selected.y + selected.height);
+        let ball_left = placement.layout.ball_offset.x;
+        let ball_right = ball_left + BALL_SIZE.x as i32;
+        let card_left = placement.layout.card_origin.x;
+        let card_right = card_left + CARD_WIDTH;
+        assert!(ball_right <= card_left || card_right <= ball_left);
+    }
+
+    let crossed_right_edge = reflow_expanded_drag(
+        Position { x: 1832, y: 300 },
+        current_ball_offset,
+        &workareas,
+        1,
+    )
+    .unwrap();
+    assert_eq!(crossed_right_edge.layout.ball_offset.x, CARD_WIDTH);
+    assert_eq!(crossed_right_edge.layout.card_origin.x, 0);
+}
+
+#[test]
+fn immediate_collapse_uses_current_expanded_position_before_settle_timeout() {
+    let workareas = [Bounds {
+        x: 0,
+        y: 24,
+        width: 1920,
+        height: 1056,
+    }];
+    let old_anchor = Position { x: 100, y: 100 };
+    let initial = expanded_layout(old_anchor, workareas[0]);
+    let dragged_viewport = Position { x: 640, y: 420 };
+
+    let committed =
+        reflow_expanded_drag(dragged_viewport, initial.ball_offset, &workareas, 0).unwrap();
+
+    assert_ne!(committed.compact_anchor, old_anchor);
+    assert_eq!(committed.compact_anchor, Position { x: 640, y: 420 });
 }
 
 #[test]

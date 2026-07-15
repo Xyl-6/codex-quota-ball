@@ -19,6 +19,12 @@ pub struct ExpandedLayout {
     pub card_origin: Position,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpandedDragPlacement {
+    pub compact_anchor: Position,
+    pub layout: ExpandedLayout,
+}
+
 pub fn expanded_layout(anchor: Position, workarea: Bounds) -> ExpandedLayout {
     let viewport_width = EXPANDED_SIZE.x as i32;
     let viewport_height = EXPANDED_SIZE.y as i32;
@@ -71,6 +77,29 @@ pub fn compact_anchor_from_viewport(
     )
 }
 
+pub fn reflow_expanded_drag(
+    viewport_origin: Position,
+    ball_offset: Position,
+    workareas: &[Bounds],
+    primary_monitor: usize,
+) -> Option<ExpandedDragPlacement> {
+    let observed_anchor = Position {
+        x: viewport_origin.x.saturating_add(ball_offset.x),
+        y: viewport_origin.y.saturating_add(ball_offset.y),
+    };
+    let workarea = select_bounds(workareas, primary_monitor, observed_anchor)?;
+    let compact_anchor = clamp_to_known_bounds(
+        observed_anchor,
+        Some(workarea),
+        BALL_SIZE.x as i32,
+        BALL_SIZE.y as i32,
+    );
+    Some(ExpandedDragPlacement {
+        compact_anchor,
+        layout: expanded_layout(compact_anchor, workarea),
+    })
+}
+
 #[derive(Default)]
 pub struct PositionSettleTracker {
     active: bool,
@@ -104,6 +133,14 @@ impl PositionSettleTracker {
             return Some(position);
         }
         None
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn stop(&mut self) {
+        self.active = false;
     }
 }
 
@@ -222,6 +259,10 @@ impl FloatingApp {
         if self.expanded == expanded {
             return;
         }
+        if self.expanded && !expanded && self.position_tracker.is_active() {
+            self.commit_expanded_position(ctx, false);
+            self.position_tracker.stop();
+        }
         let size = window_size(expanded);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         let outer_position = ctx
@@ -256,6 +297,38 @@ impl FloatingApp {
             self.expanded_layout = None;
         }
         self.expanded = expanded;
+    }
+
+    fn commit_expanded_position(&mut self, ctx: &egui::Context, reposition: bool) {
+        let Some(current_layout) = self.expanded_layout else {
+            return;
+        };
+        let Some(rect) = ctx.input(|input| input.viewport().outer_rect) else {
+            return;
+        };
+        let viewport_origin = Position {
+            x: rect.min.x.round() as i32,
+            y: rect.min.y.round() as i32,
+        };
+        let workareas = self.logical_monitor_bounds(ctx);
+        let Some(placement) = reflow_expanded_drag(
+            viewport_origin,
+            current_layout.ball_offset,
+            &workareas,
+            self.primary_monitor,
+        ) else {
+            return;
+        };
+
+        self.compact_anchor = Some(placement.compact_anchor);
+        self.expanded_layout = Some(placement.layout);
+        if reposition && placement.layout.viewport_origin != viewport_origin {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                placement.layout.viewport_origin.x as f32,
+                placement.layout.viewport_origin.y as f32,
+            )));
+        }
+        let _ = self.config.save(placement.compact_anchor);
     }
 
     fn place_once(&mut self, ctx: &egui::Context) {
@@ -313,6 +386,10 @@ impl FloatingApp {
         let Some(settled) = self.position_tracker.observe(observed, now_ms) else {
             return;
         };
+        if self.expanded {
+            self.commit_expanded_position(ctx, true);
+            return;
+        }
         let position = self.clamped_position(ctx, settled, BALL_SIZE);
         if !self.expanded && position != settled {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
