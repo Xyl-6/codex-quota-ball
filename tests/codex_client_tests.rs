@@ -95,3 +95,31 @@ fn duration_max_returns_an_error_without_panicking() {
         Err(ClientError::Timeout)
     ));
 }
+
+#[test]
+fn reads_daily_usage_after_quota_with_incrementing_ids() {
+    let (_guard, command) = fake("success");
+    let mut client = CodexClient::connect(command, Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        client
+            .read_quota()
+            .unwrap()
+            .primary
+            .unwrap()
+            .remaining_percent,
+        72
+    );
+    let usage = client.read_usage().unwrap().daily.unwrap();
+    assert_eq!(usage[0].tokens, 1200);
+    assert!(!client.is_terminal());
+}
+
+#[test]
+fn usage_method_error_does_not_poison_a_working_quota_connection() {
+    let (_guard, command) = fake("usage-error");
+    let mut client = CodexClient::connect(command, Duration::from_secs(1)).unwrap();
+    assert!(client.read_quota().is_ok());
+    assert!(matches!(client.read_usage(), Err(ClientError::Server(_))));
+    assert!(!client.is_terminal());
+    assert!(client.read_quota().is_ok());
+}

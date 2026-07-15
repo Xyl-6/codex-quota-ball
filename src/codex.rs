@@ -1,4 +1,5 @@
 use crate::quota::{parse_quota_response, QuotaSnapshot};
+use crate::usage::{parse_usage_response, UsageSnapshot};
 use serde_json::{json, Value};
 use std::{
     fmt,
@@ -164,25 +165,31 @@ impl CodexClient {
         Ok(client)
     }
 
-    pub fn read_quota(&mut self) -> Result<QuotaSnapshot, ClientError> {
+    fn request(&mut self, method: &str) -> Result<Value, ClientError> {
         if let Some(error) = &self.terminal {
             return Err(error.clone());
         }
         let id = self.next_id;
         self.next_id += 1;
         let deadline = self.deadline()?;
-        self.send(
-            &json!({"id": id, "method": "account/rateLimits/read"}),
-            deadline,
-        )?;
-        let response = self.recv_for_id(id, deadline)?;
-        match parse_quota_response(&response) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(error) => self.fail(ClientError::Protocol(format!(
-                "{} ({})",
-                error, self.version
-            ))),
-        }
+        self.send(&json!({"id": id, "method": method}), deadline)?;
+        self.recv_for_id(id, deadline)
+    }
+
+    pub fn read_quota(&mut self) -> Result<QuotaSnapshot, ClientError> {
+        let response = self.request("account/rateLimits/read")?;
+        parse_quota_response(&response)
+            .map_err(|error| ClientError::Protocol(format!("{} ({})", error, self.version)))
+    }
+
+    pub fn read_usage(&mut self) -> Result<UsageSnapshot, ClientError> {
+        let response = self.request("account/usage/read")?;
+        parse_usage_response(&response)
+            .map_err(|error| ClientError::Protocol(format!("{} ({})", error, self.version)))
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.terminal.is_some()
     }
 
     fn deadline(&mut self) -> Result<Instant, ClientError> {
