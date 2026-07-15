@@ -111,6 +111,7 @@ fn reads_daily_usage_after_quota_with_incrementing_ids() {
     );
     let usage = client.read_usage().unwrap().daily.unwrap();
     assert_eq!(usage[0].tokens, 1200);
+    assert!(client.read_quota().is_ok());
     assert!(!client.is_terminal());
 }
 
@@ -120,6 +121,15 @@ fn usage_method_error_does_not_poison_a_working_quota_connection() {
     let mut client = CodexClient::connect(command, Duration::from_secs(1)).unwrap();
     assert!(client.read_quota().is_ok());
     assert!(matches!(client.read_usage(), Err(ClientError::Server(_))));
+    assert!(!client.is_terminal());
+    assert!(client.read_quota().is_ok());
+}
+
+#[test]
+fn incompatible_usage_shape_does_not_poison_a_working_quota_connection() {
+    let (_guard, command) = fake("usage-incompatible");
+    let mut client = CodexClient::connect(command, Duration::from_secs(1)).unwrap();
+    assert!(matches!(client.read_usage(), Err(ClientError::Protocol(_))));
     assert!(!client.is_terminal());
     assert!(client.read_quota().is_ok());
 }
