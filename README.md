@@ -30,7 +30,7 @@ To install an existing executable instead of building from source:
 - Click another window or press Escape: collapse back to the saved circle position.
 - Drag the circle, or drag non-interactive card background: move and remember the position.
 - Hover a heatmap cell: show its date and exact daily token count.
-- Right click: refresh or quit.
+- Right click the circle: refresh or quit.
 - Green/yellow/red indicate Weekly remaining quota; the heatmap uses relative logarithmic green levels for the latest 26 weeks.
 
 ## Troubleshooting
