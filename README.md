@@ -26,18 +26,21 @@ To install an existing executable instead of building from source:
 
 ## Use
 
-- Left click: expand or collapse quota details.
-- Drag: move and remember the ball position.
+- Left click: smoothly expand the quota circle into the Weekly and token-history card.
+- Click another window or press Escape: collapse back to the saved circle position.
+- Drag the circle, or drag non-interactive card background: move and remember the position.
+- Hover a heatmap cell: show its date and exact daily token count.
 - Right click: refresh or quit.
-- Green means at least 50% remains, yellow means 20–49%, red means below 20%, and gray means quota is unavailable.
+- Green/yellow/red indicate Weekly remaining quota; the heatmap uses relative logarithmic green levels for the latest 26 weeks.
 
 ## Troubleshooting
 
 - “找不到 Codex CLI”: ensure `codex` is on the desktop session's `PATH`.
 - “Codex 尚未登录”: run `codex login`, then choose Retry.
+- “Token 历史不可用”: the installed Codex version may not expose `account/usage/read`; check `codex --version` and update Codex.
 - Protocol incompatibility: run `codex --version` and update Codex Quota Ball or Codex CLI to a compatible version.
 
-Codex app-server is an experimental local protocol. This application reads only `account/rateLimits/read`, stores no credentials, and may require compatibility updates when Codex changes.
+Codex app-server is an experimental local protocol. This application reads only `account/rateLimits/read` and `account/usage/read`, stores no credentials, prompts, source code, or local token database, and may require compatibility updates when Codex changes.
 
 ## Uninstall
 
