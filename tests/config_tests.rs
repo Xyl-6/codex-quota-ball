@@ -23,6 +23,20 @@ fn saves_and_loads_position_atomically() {
 }
 
 #[test]
+fn saves_when_legacy_temporary_path_is_occupied() {
+    let path = temp_path("temporary-collision");
+    let legacy_temporary = path.with_extension("json.tmp");
+    fs::create_dir(&legacy_temporary).unwrap();
+
+    let store = ConfigStore::new(path.clone());
+    store.save(Position { x: 321, y: 654 }).unwrap();
+
+    assert_eq!(store.load(), Some(Position { x: 321, y: 654 }));
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_dir(legacy_temporary);
+}
+
+#[test]
 fn malformed_config_falls_back_without_panicking() {
     let path = temp_path("malformed");
     fs::write(&path, "not-json").unwrap();

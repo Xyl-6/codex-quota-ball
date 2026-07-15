@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+static TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
@@ -29,10 +37,38 @@ impl ConfigStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temporary = self.path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(&position).map_err(io::Error::other)?;
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, &self.path)
+
+        let (temporary, mut file) = loop {
+            let id = TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
+            let mut name =
+                self.path.file_name().map(OsString::from).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing file name")
+                })?;
+            name.push(format!(".{}.{id}.tmp", std::process::id()));
+            let temporary = self.path.with_file_name(name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+
+        let write_result = file.write_all(&bytes);
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            let _ = fs::remove_file(temporary);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
