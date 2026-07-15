@@ -1,12 +1,66 @@
 use crate::{
-    config::{clamp_position, default_position, ConfigStore, Position},
+    config::{ConfigStore, Position},
     quota::{format_reset_time, ring_tone, QuotaWindow, RingTone},
     worker::{QuotaViewState, WorkerHandle},
+    x11::{clamp_to_bounds, query_monitor_bounds, select_bounds, Bounds},
 };
 use eframe::egui;
+use std::time::Instant;
 
 pub const BALL_SIZE: egui::Vec2 = egui::vec2(88.0, 88.0);
 pub const EXPANDED_SIZE: egui::Vec2 = egui::vec2(360.0, 260.0);
+pub const POSITION_SETTLE_MS: u64 = 500;
+
+#[derive(Default)]
+pub struct PositionSettleTracker {
+    active: bool,
+    initial: Option<Position>,
+    candidate: Option<Position>,
+    changed_at_ms: u64,
+    moved: bool,
+}
+
+impl PositionSettleTracker {
+    pub fn start(&mut self, position: Option<Position>, now_ms: u64) {
+        self.active = true;
+        self.initial = position;
+        self.candidate = position;
+        self.changed_at_ms = now_ms;
+        self.moved = false;
+    }
+
+    pub fn observe(&mut self, position: Position, now_ms: u64) -> Option<Position> {
+        if !self.active {
+            return None;
+        }
+        if self.candidate != Some(position) {
+            self.candidate = Some(position);
+            self.changed_at_ms = now_ms;
+            self.moved |= self.initial != Some(position);
+            return None;
+        }
+        if self.moved && now_ms.saturating_sub(self.changed_at_ms) >= POSITION_SETTLE_MS {
+            self.active = false;
+            return Some(position);
+        }
+        None
+    }
+}
+
+pub fn concise_error(error: &str, max_chars: usize) -> String {
+    let count = error.chars().count();
+    if count <= max_chars {
+        return error.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    error
+        .chars()
+        .take(max_chars - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
 
 pub fn window_size(expanded: bool) -> egui::Vec2 {
     if expanded {
@@ -37,11 +91,16 @@ pub struct FloatingApp {
     saved_position: Option<Position>,
     expanded: bool,
     positioned: bool,
+    monitor_bounds: Vec<Bounds>,
+    primary_monitor: usize,
+    position_tracker: PositionSettleTracker,
+    started_at: Instant,
 }
 
 impl FloatingApp {
     pub fn new(worker: WorkerHandle, config: ConfigStore) -> Self {
         let saved_position = config.load();
+        let (monitor_bounds, primary_monitor) = query_monitor_bounds().unwrap_or_default();
         Self {
             worker,
             state: QuotaViewState::default(),
@@ -49,25 +108,42 @@ impl FloatingApp {
             saved_position,
             expanded: false,
             positioned: false,
+            monitor_bounds,
+            primary_monitor,
+            position_tracker: PositionSettleTracker::default(),
+            started_at: Instant::now(),
         }
     }
 
-    fn clamp_to_monitor(&self, ctx: &egui::Context, size: egui::Vec2) -> Option<Position> {
-        let (monitor, outer) =
-            ctx.input(|input| (input.viewport().monitor_size, input.viewport().outer_rect));
-        let (Some(monitor), Some(outer)) = (monitor, outer) else {
-            return None;
-        };
-        Some(clamp_position(
-            Position {
-                x: outer.min.x.round() as i32,
-                y: outer.min.y.round() as i32,
-            },
-            monitor.x as i32,
-            monitor.y as i32,
-            size.x as i32,
-            size.y as i32,
-        ))
+    fn fallback_bounds(ctx: &egui::Context) -> Bounds {
+        let size = ctx
+            .input(|input| input.viewport().monitor_size)
+            .unwrap_or(egui::vec2(1920.0, 1080.0));
+        Bounds {
+            x: 0,
+            y: 0,
+            width: size.x.round() as i32,
+            height: size.y.round() as i32,
+        }
+    }
+
+    fn bounds_for(&self, ctx: &egui::Context, position: Position) -> Bounds {
+        select_bounds(&self.monitor_bounds, self.primary_monitor, position)
+            .unwrap_or_else(|| Self::fallback_bounds(ctx))
+    }
+
+    fn clamped_position(
+        &self,
+        ctx: &egui::Context,
+        position: Position,
+        size: egui::Vec2,
+    ) -> Position {
+        clamp_to_bounds(
+            position,
+            self.bounds_for(ctx, position),
+            size.x.round() as i32,
+            size.y.round() as i32,
+        )
     }
 
     fn set_expanded(&mut self, ctx: &egui::Context, expanded: bool) {
@@ -77,7 +153,15 @@ impl FloatingApp {
         self.expanded = expanded;
         let size = window_size(expanded);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        if let Some(position) = self.clamp_to_monitor(ctx, size) {
+        if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
+            let position = self.clamped_position(
+                ctx,
+                Position {
+                    x: outer.min.x.round() as i32,
+                    y: outer.min.y.round() as i32,
+                },
+                size,
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 position.x as f32,
                 position.y as f32,
@@ -92,19 +176,21 @@ impl FloatingApp {
         if self.positioned {
             return;
         }
-        let monitor = ctx
-            .input(|input| input.viewport().monitor_size)
-            .unwrap_or(egui::vec2(1920.0, 1080.0));
-        let initial = self
+        let bounds = self
             .saved_position
-            .unwrap_or_else(|| default_position(monitor.x as i32, BALL_SIZE.x as i32));
-        let clamped = clamp_position(
-            initial,
-            monitor.x as i32,
-            monitor.y as i32,
-            BALL_SIZE.x as i32,
-            BALL_SIZE.y as i32,
-        );
+            .and_then(|position| {
+                select_bounds(&self.monitor_bounds, self.primary_monitor, position)
+            })
+            .or_else(|| self.monitor_bounds.get(self.primary_monitor).copied())
+            .or_else(|| self.monitor_bounds.first().copied())
+            .unwrap_or_else(|| Self::fallback_bounds(ctx));
+        let initial = self.saved_position.unwrap_or(Position {
+            x: bounds
+                .x
+                .saturating_add((bounds.width - BALL_SIZE.x as i32 - 24).max(0)),
+            y: bounds.y.saturating_add(24),
+        });
+        let clamped = clamp_to_bounds(initial, bounds, BALL_SIZE.x as i32, BALL_SIZE.y as i32);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             clamped.x as f32,
             clamped.y as f32,
@@ -112,15 +198,26 @@ impl FloatingApp {
         self.positioned = true;
     }
 
-    fn save_current_position(&mut self, ctx: &egui::Context) {
-        let size = window_size(self.expanded);
-        let Some(position) = self.clamp_to_monitor(ctx, size) else {
+    fn track_current_position(&mut self, ctx: &egui::Context) {
+        let Some(rect) = ctx.input(|input| input.viewport().outer_rect) else {
             return;
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-            position.x as f32,
-            position.y as f32,
-        )));
+        let observed = Position {
+            x: rect.min.x.round() as i32,
+            y: rect.min.y.round() as i32,
+        };
+        let now_ms = self.started_at.elapsed().as_millis() as u64;
+        let Some(settled) = self.position_tracker.observe(observed, now_ms) else {
+            return;
+        };
+        let size = window_size(self.expanded);
+        let position = self.clamped_position(ctx, settled, size);
+        if position != settled {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                position.x as f32,
+                position.y as f32,
+            )));
+        }
         if self.config.save(position).is_ok() {
             self.saved_position = Some(position);
         }
@@ -239,10 +336,19 @@ impl FloatingApp {
                         ui.add_space(10.0);
                         Self::quota_row(ui, "周周期窗口", secondary);
                         if let Some(error) = &self.state.error {
-                            ui.colored_label(egui::Color32::from_rgb(248, 113, 113), error);
-                            if ui.button("重试").clicked() {
-                                self.worker.request_refresh();
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("重试").clicked() {
+                                    self.worker.request_refresh();
+                                }
+                                ui.add_sized(
+                                    [220.0, 20.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(concise_error(error, 96))
+                                            .color(egui::Color32::from_rgb(248, 113, 113)),
+                                    )
+                                    .truncate(),
+                                );
+                            });
                         }
                     });
             });
@@ -256,6 +362,7 @@ impl eframe::App for FloatingApp {
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.place_once(ctx);
+        self.track_current_position(ctx);
         while let Ok(event) = self.worker.events.try_recv() {
             self.state.apply(event);
         }
@@ -271,10 +378,15 @@ impl eframe::App for FloatingApp {
                     ui.interact(ball, ui.id().with("ball"), egui::Sense::click_and_drag());
                 self.paint_ball(ui, ball);
                 if response.drag_started() {
+                    let current =
+                        ctx.input(|input| input.viewport().outer_rect)
+                            .map(|rect| Position {
+                                x: rect.min.x.round() as i32,
+                                y: rect.min.y.round() as i32,
+                            });
+                    self.position_tracker
+                        .start(current, self.started_at.elapsed().as_millis() as u64);
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                if response.drag_stopped() {
-                    self.save_current_position(ctx);
                 }
                 if response.clicked() {
                     self.set_expanded(ctx, !self.expanded);
