@@ -1,6 +1,7 @@
 pub mod codex;
 pub mod config;
 pub mod fonts;
+pub mod morph;
 pub mod quota;
 pub mod ui;
 pub mod usage;
