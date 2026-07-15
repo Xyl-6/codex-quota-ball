@@ -9,7 +9,7 @@ use crate::{
     worker::{DashboardViewState, SectionState, WorkerHandle},
     x11::{
         clamp_to_known_bounds, query_monitor_bounds, rounded_input_rectangles, select_bounds,
-        Bounds, InputShaper,
+        Bounds, InputShaper, InputShaperInitError, INPUT_SHAPE_RETRY_MS,
     },
 };
 use chrono::Local;
@@ -59,11 +59,23 @@ pub fn point_in_rounded_rect(rect: egui::Rect, radius: f32, point: egui::Pos2) -
 pub fn background_drag_allowed(
     surface: egui::Rect,
     radius: f32,
-    point: egui::Pos2,
+    press_origin: Option<egui::Pos2>,
+    current: Option<egui::Pos2>,
     blockers: &[egui::Rect],
 ) -> bool {
-    point_in_rounded_rect(surface, radius, point)
-        && !blockers.iter().any(|rect| rect.contains(point))
+    press_origin.or(current).is_some_and(|point| {
+        point_in_rounded_rect(surface, radius, point)
+            && !blockers.iter().any(|rect| rect.contains(point))
+    })
+}
+
+pub fn input_shape_pixels_per_point(ctx: &egui::Context) -> f32 {
+    let pixels_per_point = ctx.pixels_per_point();
+    if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    }
 }
 
 pub fn rounded_surface_rects(surface: egui::Rect, radius: f32) -> Vec<egui::Rect> {
@@ -217,7 +229,8 @@ pub struct FloatingApp {
     position_tracker: PositionSettleTracker,
     started_at: Instant,
     input_shaper: Option<InputShaper>,
-    input_shape_attempted: bool,
+    input_shape_disabled: bool,
+    input_shape_retry_at_ms: u64,
 }
 
 impl FloatingApp {
@@ -237,7 +250,8 @@ impl FloatingApp {
             position_tracker: PositionSettleTracker::default(),
             started_at: Instant::now(),
             input_shaper: None,
-            input_shape_attempted: false,
+            input_shape_disabled: false,
+            input_shape_retry_at_ms: 0,
         }
     }
 
@@ -834,29 +848,27 @@ impl eframe::App for FloatingApp {
         }
 
         let frame = self.morph.frame(self.now_ms());
-        if !self.input_shape_attempted {
-            self.input_shape_attempted = true;
-            self.input_shaper = InputShaper::from_frame(native_frame);
+        let now_ms = self.now_ms();
+        if self.input_shaper.is_none()
+            && !self.input_shape_disabled
+            && now_ms >= self.input_shape_retry_at_ms
+        {
+            match InputShaper::from_frame(native_frame) {
+                Ok(shaper) => self.input_shaper = Some(shaper),
+                Err(InputShaperInitError::Retry) => {
+                    self.input_shape_retry_at_ms = now_ms.saturating_add(INPUT_SHAPE_RETRY_MS);
+                }
+                Err(InputShaperInitError::Unsupported) => self.input_shape_disabled = true,
+            }
         }
-        let pixels_per_point = ctx.input(|input| {
-            input
-                .viewport()
-                .native_pixels_per_point
-                .filter(|scale| scale.is_finite() && *scale > 0.0)
-                .unwrap_or(1.0)
-        });
-        let input_shape_failed = self.input_shaper.as_mut().is_some_and(|shaper| {
-            shaper
-                .update(
-                    frame.size.x,
-                    frame.size.y,
-                    frame.corner_radius,
-                    pixels_per_point,
-                )
-                .is_err()
-        });
-        if input_shape_failed {
-            self.input_shaper = None;
+        if let Some(shaper) = self.input_shaper.as_mut() {
+            shaper.update(
+                frame.size.x,
+                frame.size.y,
+                frame.corner_radius,
+                input_shape_pixels_per_point(ctx),
+                now_ms,
+            );
         }
         if let Some(placement) = self.placement {
             let origin = origin_for_size(&placement, frame.size);
@@ -905,11 +917,16 @@ impl eframe::App for FloatingApp {
                 if frame.content_alpha > 0.0 {
                     self.paint_card_content(ui, rect, frame.content_alpha);
                 }
-                let pointer = ctx.input(|input| input.pointer.interact_pos());
+                let (press_origin, pointer) =
+                    ctx.input(|input| (input.pointer.press_origin(), input.pointer.interact_pos()));
                 let background_allowed = !frame.animating
-                    && pointer.is_some_and(|point| {
-                        background_drag_allowed(rect, frame.corner_radius, point, &blockers)
-                    });
+                    && background_drag_allowed(
+                        rect,
+                        frame.corner_radius,
+                        press_origin,
+                        pointer,
+                        &blockers,
+                    );
                 if background_allowed && responses.iter().any(egui::Response::drag_started) {
                     self.start_drag(ctx);
                 }

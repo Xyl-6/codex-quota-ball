@@ -4,8 +4,9 @@ use codex_quota_ball::{
     morph::{Growth, MorphPhase},
     ui::{
         background_drag_allowed, compact_face_geometry, concise_error, heat_cell_rect,
-        heat_tooltip, point_in_rounded_rect, ring_points, rounded_surface_rects, should_collapse,
-        should_drive_viewport_position, PositionSettleTracker,
+        heat_tooltip, input_shape_pixels_per_point, point_in_rounded_rect, ring_points,
+        rounded_surface_rects, should_collapse, should_drive_viewport_position,
+        PositionSettleTracker,
     },
     usage::HeatCell,
     x11::{
@@ -56,21 +57,65 @@ fn rounded_surface_rejects_transparent_corners_and_control_regions() {
     assert!(background_drag_allowed(
         surface,
         18.0,
-        egui::pos2(280.0, 146.0),
+        Some(egui::pos2(280.0, 146.0)),
+        Some(egui::pos2(280.0, 146.0)),
         &blockers
     ));
     assert!(!background_drag_allowed(
         surface,
         18.0,
-        refresh.center(),
+        Some(refresh.center()),
+        Some(refresh.center()),
         &blockers
     ));
     assert!(!background_drag_allowed(
         surface,
         18.0,
-        heat_cell.center(),
+        Some(heat_cell.center()),
+        Some(heat_cell.center()),
         &blockers
     ));
+}
+
+#[test]
+fn background_drag_blockers_follow_the_press_origin_not_the_current_pointer() {
+    let surface = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(290.0, 292.0));
+    let heat_cell = egui::Rect::from_min_size(egui::pos2(40.0, 152.0), egui::vec2(7.0, 7.0));
+    let background = egui::pos2(280.0, 146.0);
+
+    assert!(!background_drag_allowed(
+        surface,
+        18.0,
+        Some(heat_cell.center()),
+        Some(background),
+        &[heat_cell],
+    ));
+    assert!(background_drag_allowed(
+        surface,
+        18.0,
+        Some(background),
+        Some(heat_cell.center()),
+        &[heat_cell],
+    ));
+}
+
+#[test]
+fn input_shape_scale_includes_native_scale_and_user_zoom() {
+    let ctx = egui::Context::default();
+    ctx.set_zoom_factor(1.5);
+    let mut input = egui::RawInput::default();
+    input
+        .viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .native_pixels_per_point = Some(2.0);
+    let mut selected = 0.0;
+
+    let _ = ctx.run(input, |ctx| {
+        selected = input_shape_pixels_per_point(ctx);
+    });
+
+    assert_eq!(selected, 3.0);
 }
 
 #[test]

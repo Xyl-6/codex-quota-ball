@@ -3,7 +3,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Rectangle, Window};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PixmapEnum, Rectangle, Window};
 use x11rb::rust_connection::RustConnection;
 
 pub fn rounded_input_rectangles(
@@ -78,32 +78,204 @@ fn same_rectangles(left: &[Rectangle], right: &[Rectangle]) -> bool {
 }
 
 pub struct InputShaper {
-    connection: RustConnection,
+    connection: Option<RustConnection>,
     window: Window,
-    last_rectangles: Vec<Rectangle>,
+    last_rectangles: Option<Vec<Rectangle>>,
+    policy: InputShapePolicy,
 }
 
-#[derive(Debug)]
-pub struct InputShapeError;
+pub const INPUT_SHAPE_RETRY_MS: u64 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputShapeAction {
+    Connect,
+    Update,
+    Reset,
+    Wait,
+    Idle,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputShapePhase {
+    Connect { reset: bool },
+    Ready,
+    ResetCurrent,
+    ResetFresh,
+    RetryConnect { reset: bool, at_ms: u64 },
+    RetryUpdate { at_ms: u64 },
+    Disabled,
+}
+
+pub struct InputShapePolicy {
+    phase: InputShapePhase,
+    cache_valid: bool,
+}
+
+impl Default for InputShapePolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputShapePolicy {
+    pub fn new() -> Self {
+        Self {
+            phase: InputShapePhase::Connect { reset: false },
+            cache_valid: false,
+        }
+    }
+
+    pub fn action(&mut self, now_ms: u64, cache_matches: bool) -> InputShapeAction {
+        match self.phase {
+            InputShapePhase::RetryConnect { reset, at_ms } if now_ms >= at_ms => {
+                self.phase = InputShapePhase::Connect { reset };
+                InputShapeAction::Connect
+            }
+            InputShapePhase::RetryUpdate { at_ms } if now_ms >= at_ms => {
+                self.phase = InputShapePhase::Ready;
+                InputShapeAction::Update
+            }
+            InputShapePhase::Connect { .. } => InputShapeAction::Connect,
+            InputShapePhase::Ready if self.cache_valid && cache_matches => InputShapeAction::Idle,
+            InputShapePhase::Ready => InputShapeAction::Update,
+            InputShapePhase::ResetCurrent | InputShapePhase::ResetFresh => InputShapeAction::Reset,
+            InputShapePhase::RetryConnect { .. } | InputShapePhase::RetryUpdate { .. } => {
+                InputShapeAction::Wait
+            }
+            InputShapePhase::Disabled => InputShapeAction::Disabled,
+        }
+    }
+
+    pub fn connect_succeeded(&mut self) {
+        self.phase = match self.phase {
+            InputShapePhase::Connect { reset: true } => InputShapePhase::ResetFresh,
+            _ => InputShapePhase::Ready,
+        };
+    }
+
+    pub fn connect_failed(&mut self, now_ms: u64) {
+        let reset = matches!(self.phase, InputShapePhase::Connect { reset: true });
+        self.cache_valid = false;
+        self.phase = InputShapePhase::RetryConnect {
+            reset,
+            at_ms: now_ms.saturating_add(INPUT_SHAPE_RETRY_MS),
+        };
+    }
+
+    pub fn unsupported(&mut self) {
+        self.cache_valid = false;
+        self.phase = InputShapePhase::Disabled;
+    }
+
+    pub fn update_succeeded(&mut self) {
+        self.cache_valid = true;
+        self.phase = InputShapePhase::Ready;
+    }
+
+    pub fn update_failed(&mut self) {
+        self.cache_valid = false;
+        self.phase = InputShapePhase::ResetCurrent;
+    }
+
+    pub fn reset_succeeded(&mut self, now_ms: u64) {
+        self.cache_valid = false;
+        self.phase = InputShapePhase::RetryUpdate {
+            at_ms: now_ms.saturating_add(INPUT_SHAPE_RETRY_MS),
+        };
+    }
+
+    pub fn reset_failed(&mut self, now_ms: u64) {
+        self.cache_valid = false;
+        self.phase = match self.phase {
+            InputShapePhase::ResetCurrent => InputShapePhase::Connect { reset: true },
+            _ => InputShapePhase::RetryConnect {
+                reset: true,
+                at_ms: now_ms.saturating_add(INPUT_SHAPE_RETRY_MS),
+            },
+        };
+    }
+
+    pub fn cache_valid(&self) -> bool {
+        self.cache_valid
+    }
+}
+
+pub enum InputShaperInitError {
+    Retry,
+    Unsupported,
+}
+
+enum ConnectFailure {
+    Transient,
+    Unsupported,
+}
+
+fn reset_input_shape(connection: &RustConnection, window: Window) -> Result<(), ()> {
+    connection
+        .shape_mask(SO::SET, SK::INPUT, window, 0, 0, PixmapEnum::NONE)
+        .map_err(|_| ())?
+        .check()
+        .map_err(|_| ())?;
+    connection.flush().map_err(|_| ())
+}
+
+fn update_input_shape(
+    connection: &RustConnection,
+    window: Window,
+    rectangles: &[Rectangle],
+) -> Result<(), ()> {
+    connection
+        .shape_rectangles(
+            SO::SET,
+            SK::INPUT,
+            x11rb::protocol::xproto::ClipOrdering::YX_BANDED,
+            window,
+            0,
+            0,
+            rectangles,
+        )
+        .map_err(|_| ())?
+        .check()
+        .map_err(|_| ())?;
+    connection.flush().map_err(|_| ())
+}
 
 impl InputShaper {
-    pub fn from_frame(frame: &eframe::Frame) -> Option<Self> {
-        let raw = frame.window_handle().ok()?.as_raw();
-        let window = match raw {
-            RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok()?,
-            RawWindowHandle::Xcb(handle) => handle.window.get(),
-            _ => return None,
+    pub fn from_frame(frame: &eframe::Frame) -> Result<Self, InputShaperInitError> {
+        let Ok(handle) = frame.window_handle() else {
+            return Err(InputShaperInitError::Retry);
         };
-        let (connection, _) = x11rb::connect(None).ok()?;
-        let version = connection.shape_query_version().ok()?.reply().ok()?;
-        if version.major_version < 1 || (version.major_version == 1 && version.minor_version < 1) {
-            return None;
-        }
-        Some(Self {
-            connection,
+        let raw = handle.as_raw();
+        let window = match raw {
+            RawWindowHandle::Xlib(handle) => {
+                let Ok(window) = u32::try_from(handle.window) else {
+                    return Err(InputShaperInitError::Unsupported);
+                };
+                window
+            }
+            RawWindowHandle::Xcb(handle) => handle.window.get(),
+            _ => return Err(InputShaperInitError::Unsupported),
+        };
+        Ok(Self {
+            connection: None,
             window,
-            last_rectangles: Vec::new(),
+            last_rectangles: None,
+            policy: InputShapePolicy::new(),
         })
+    }
+
+    fn connect() -> Result<RustConnection, ConnectFailure> {
+        let (connection, _) = x11rb::connect(None).map_err(|_| ConnectFailure::Transient)?;
+        let version = connection
+            .shape_query_version()
+            .map_err(|_| ConnectFailure::Transient)?
+            .reply()
+            .map_err(|_| ConnectFailure::Transient)?;
+        if version.major_version < 1 || (version.major_version == 1 && version.minor_version < 1) {
+            return Err(ConnectFailure::Unsupported);
+        }
+        Ok(connection)
     }
 
     pub fn update(
@@ -112,32 +284,63 @@ impl InputShaper {
         logical_height: f32,
         logical_radius: f32,
         pixels_per_point: f32,
-    ) -> Result<(), InputShapeError> {
+        now_ms: u64,
+    ) {
         let rectangles = rounded_input_rectangles(
             logical_width,
             logical_height,
             logical_radius,
             pixels_per_point,
         );
-        if same_rectangles(&self.last_rectangles, &rectangles) {
-            return Ok(());
+        for _ in 0..5 {
+            let cache_matches = self
+                .last_rectangles
+                .as_deref()
+                .is_some_and(|last| same_rectangles(last, &rectangles));
+            match self.policy.action(now_ms, cache_matches) {
+                InputShapeAction::Connect => match Self::connect() {
+                    Ok(connection) => {
+                        self.connection = Some(connection);
+                        self.policy.connect_succeeded();
+                    }
+                    Err(ConnectFailure::Transient) => {
+                        self.policy.connect_failed(now_ms);
+                        break;
+                    }
+                    Err(ConnectFailure::Unsupported) => {
+                        self.policy.unsupported();
+                        break;
+                    }
+                },
+                InputShapeAction::Update => {
+                    let result = self.connection.as_ref().map_or(Err(()), |connection| {
+                        update_input_shape(connection, self.window, &rectangles)
+                    });
+                    if result.is_ok() {
+                        self.last_rectangles = Some(rectangles);
+                        self.policy.update_succeeded();
+                        break;
+                    }
+                    self.last_rectangles = None;
+                    self.policy.update_failed();
+                }
+                InputShapeAction::Reset => {
+                    let result = self.connection.as_ref().map_or(Err(()), |connection| {
+                        reset_input_shape(connection, self.window)
+                    });
+                    self.last_rectangles = None;
+                    if result.is_ok() {
+                        self.policy.reset_succeeded(now_ms);
+                        break;
+                    }
+                    self.connection = None;
+                    self.policy.reset_failed(now_ms);
+                }
+                InputShapeAction::Wait | InputShapeAction::Idle | InputShapeAction::Disabled => {
+                    break
+                }
+            }
         }
-        self.connection
-            .shape_rectangles(
-                SO::SET,
-                SK::INPUT,
-                x11rb::protocol::xproto::ClipOrdering::YX_BANDED,
-                self.window,
-                0,
-                0,
-                &rectangles,
-            )
-            .map_err(|_| InputShapeError)?
-            .check()
-            .map_err(|_| InputShapeError)?;
-        self.connection.flush().map_err(|_| InputShapeError)?;
-        self.last_rectangles = rectangles;
-        Ok(())
     }
 }
 
