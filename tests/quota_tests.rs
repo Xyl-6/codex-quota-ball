@@ -5,6 +5,7 @@ use serde_json::json;
 
 #[test]
 fn converts_used_to_remaining_and_clamps_bad_values() {
+    assert_eq!(remaining_percent(i64::MIN), 100);
     assert_eq!(remaining_percent(-4), 100);
     assert_eq!(remaining_percent(0), 100);
     assert_eq!(remaining_percent(50), 50);
@@ -15,6 +16,7 @@ fn converts_used_to_remaining_and_clamps_bad_values() {
 
 #[test]
 fn selects_exact_color_boundaries() {
+    assert_eq!(ring_tone(Some(255)), RingTone::Green);
     assert_eq!(ring_tone(Some(50)), RingTone::Green);
     assert_eq!(ring_tone(Some(49)), RingTone::Yellow);
     assert_eq!(ring_tone(Some(20)), RingTone::Yellow);

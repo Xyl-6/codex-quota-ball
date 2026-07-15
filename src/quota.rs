@@ -50,12 +50,12 @@ struct SnapshotWire {
 }
 
 pub fn remaining_percent(used_percent: i64) -> u8 {
-    (100 - used_percent).clamp(0, 100) as u8
+    (100 - used_percent.clamp(0, 100)) as u8
 }
 
 pub fn ring_tone(remaining: Option<u8>) -> RingTone {
     match remaining {
-        Some(50..=100) => RingTone::Green,
+        Some(50..) => RingTone::Green,
         Some(20..=49) => RingTone::Yellow,
         Some(_) => RingTone::Red,
         None => RingTone::Gray,
