@@ -1,6 +1,7 @@
 use crate::config::Position;
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
@@ -70,6 +71,88 @@ impl Bounds {
             && point.x < self.x.saturating_add(self.width)
             && point.y < self.y.saturating_add(self.height)
     }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = self
+            .x
+            .saturating_add(self.width)
+            .min(other.x.saturating_add(other.width));
+        let bottom = self
+            .y
+            .saturating_add(self.height)
+            .min(other.y.saturating_add(other.height));
+        (right > left && bottom > top).then_some(Self {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+}
+
+pub fn parse_workarea_rects(values: &[u32]) -> Option<Vec<Bounds>> {
+    if values.is_empty() || !values.len().is_multiple_of(4) {
+        return None;
+    }
+    values
+        .chunks_exact(4)
+        .map(|rect| {
+            let width = i32::try_from(rect[2]).ok()?;
+            let height = i32::try_from(rect[3]).ok()?;
+            (width > 0 && height > 0).then_some(Bounds {
+                x: rect[0] as i32,
+                y: rect[1] as i32,
+                width,
+                height,
+            })
+        })
+        .collect()
+}
+
+pub fn resolve_workareas(
+    gtk_values: Option<&[u32]>,
+    net_values: Option<&[u32]>,
+    current_desktop: usize,
+    monitors: &[Bounds],
+) -> Vec<Bounds> {
+    if let Some(workareas) = gtk_values.and_then(parse_workarea_rects) {
+        return workareas;
+    }
+
+    let net_workarea = net_values
+        .and_then(parse_workarea_rects)
+        .and_then(|workareas| workareas.get(current_desktop).copied());
+    if let Some(workarea) = net_workarea {
+        let intersections: Vec<_> = monitors
+            .iter()
+            .filter_map(|monitor| monitor.intersection(workarea))
+            .collect();
+        if !intersections.is_empty() {
+            return intersections;
+        }
+        return vec![workarea];
+    }
+
+    monitors.to_vec()
+}
+
+fn cardinal_property<C: Connection>(connection: &C, root: Window, name: &str) -> Option<Vec<u32>> {
+    let atom = connection
+        .intern_atom(false, name.as_bytes())
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let reply = connection
+        .get_property(false, root, atom, AtomEnum::CARDINAL, 0, u32::MAX)
+        .ok()?
+        .reply()
+        .ok()?;
+    (reply.format == 32 && reply.type_ == u32::from(AtomEnum::CARDINAL))
+        .then(|| reply.value32().map(Iterator::collect))
+        .flatten()
 }
 
 pub fn query_monitor_bounds() -> Option<(Vec<Bounds>, usize)> {
@@ -96,5 +179,18 @@ pub fn query_monitor_bounds() -> Option<(Vec<Bounds>, usize)> {
             height: i32::from(monitor.height),
         });
     }
-    (!bounds.is_empty()).then_some((bounds, primary))
+    if bounds.is_empty() {
+        return None;
+    }
+
+    let current_desktop = cardinal_property(&connection, root, "_NET_CURRENT_DESKTOP")
+        .and_then(|values| values.first().copied())
+        .and_then(|desktop| usize::try_from(desktop).ok())
+        .unwrap_or(0);
+    let gtk_name = format!("_GTK_WORKAREAS_D{current_desktop}");
+    let gtk = cardinal_property(&connection, root, &gtk_name);
+    let net = cardinal_property(&connection, root, "_NET_WORKAREA");
+    let workareas = resolve_workareas(gtk.as_deref(), net.as_deref(), current_desktop, &bounds);
+    let primary = primary.min(workareas.len().saturating_sub(1));
+    Some((workareas, primary))
 }

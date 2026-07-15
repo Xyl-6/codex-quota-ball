@@ -9,7 +9,67 @@ use std::time::Instant;
 
 pub const BALL_SIZE: egui::Vec2 = egui::vec2(88.0, 88.0);
 pub const EXPANDED_SIZE: egui::Vec2 = egui::vec2(360.0, 260.0);
+pub const CARD_WIDTH: i32 = 272;
 pub const POSITION_SETTLE_MS: u64 = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpandedLayout {
+    pub viewport_origin: Position,
+    pub ball_offset: Position,
+    pub card_origin: Position,
+}
+
+pub fn expanded_layout(anchor: Position, workarea: Bounds) -> ExpandedLayout {
+    let viewport_width = EXPANDED_SIZE.x as i32;
+    let viewport_height = EXPANDED_SIZE.y as i32;
+    let ball_width = BALL_SIZE.x as i32;
+    let ball_height = BALL_SIZE.y as i32;
+    let right = workarea.x.saturating_add(workarea.width);
+    let card_on_right = anchor.x.saturating_add(viewport_width) <= right;
+    let desired_x = if card_on_right {
+        anchor.x
+    } else {
+        anchor.x.saturating_sub(CARD_WIDTH)
+    };
+    let viewport_origin = clamp_to_known_bounds(
+        Position {
+            x: desired_x,
+            y: anchor.y,
+        },
+        Some(workarea),
+        viewport_width,
+        viewport_height,
+    );
+    let ball_offset = Position {
+        x: if card_on_right { 0 } else { CARD_WIDTH },
+        y: (anchor.y - viewport_origin.y).clamp(0, viewport_height - ball_height),
+    };
+    let card_origin = Position {
+        x: if card_on_right { ball_width } else { 0 },
+        y: 0,
+    };
+    ExpandedLayout {
+        viewport_origin,
+        ball_offset,
+        card_origin,
+    }
+}
+
+pub fn compact_anchor_from_viewport(
+    viewport_origin: Position,
+    ball_offset: Position,
+    workarea: Bounds,
+) -> Position {
+    clamp_to_known_bounds(
+        Position {
+            x: viewport_origin.x.saturating_add(ball_offset.x),
+            y: viewport_origin.y.saturating_add(ball_offset.y),
+        },
+        Some(workarea),
+        BALL_SIZE.x as i32,
+        BALL_SIZE.y as i32,
+    )
+}
 
 #[derive(Default)]
 pub struct PositionSettleTracker {
@@ -88,8 +148,9 @@ pub struct FloatingApp {
     worker: WorkerHandle,
     state: QuotaViewState,
     config: ConfigStore,
-    saved_position: Option<Position>,
+    compact_anchor: Option<Position>,
     expanded: bool,
+    expanded_layout: Option<ExpandedLayout>,
     positioned: bool,
     monitor_bounds: Vec<Bounds>,
     primary_monitor: usize,
@@ -99,14 +160,15 @@ pub struct FloatingApp {
 
 impl FloatingApp {
     pub fn new(worker: WorkerHandle, config: ConfigStore) -> Self {
-        let saved_position = config.load();
+        let compact_anchor = config.load();
         let (monitor_bounds, primary_monitor) = query_monitor_bounds().unwrap_or_default();
         Self {
             worker,
             state: QuotaViewState::default(),
             config,
-            saved_position,
+            compact_anchor,
             expanded: false,
+            expanded_layout: None,
             positioned: false,
             monitor_bounds,
             primary_monitor,
@@ -160,26 +222,40 @@ impl FloatingApp {
         if self.expanded == expanded {
             return;
         }
-        self.expanded = expanded;
         let size = window_size(expanded);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
-            let position = self.clamped_position(
-                ctx,
-                Position {
-                    x: outer.min.x.round() as i32,
-                    y: outer.min.y.round() as i32,
-                },
-                size,
-            );
+        let outer_position = ctx
+            .input(|input| input.viewport().outer_rect)
+            .map(|outer| Position {
+                x: outer.min.x.round() as i32,
+                y: outer.min.y.round() as i32,
+            });
+        if expanded {
+            let anchor = outer_position.or(self.compact_anchor);
+            if let Some(anchor) = anchor {
+                let anchor = self.clamped_position(ctx, anchor, BALL_SIZE);
+                self.compact_anchor = Some(anchor);
+                let bounds = self.logical_monitor_bounds(ctx);
+                let workarea = select_bounds(&bounds, self.primary_monitor, anchor)
+                    .unwrap_or_else(|| Self::fallback_bounds(ctx));
+                let layout = expanded_layout(anchor, workarea);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    layout.viewport_origin.x as f32,
+                    layout.viewport_origin.y as f32,
+                )));
+                self.expanded_layout = Some(layout);
+            }
+            self.worker.request_refresh();
+        } else if let Some(anchor) = self.compact_anchor {
+            let position = self.clamped_position(ctx, anchor, BALL_SIZE);
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 position.x as f32,
                 position.y as f32,
             )));
+            self.compact_anchor = Some(position);
+            self.expanded_layout = None;
         }
-        if expanded {
-            self.worker.request_refresh();
-        }
+        self.expanded = expanded;
     }
 
     fn place_once(&mut self, ctx: &egui::Context) {
@@ -188,11 +264,11 @@ impl FloatingApp {
         }
         let monitor_bounds = self.logical_monitor_bounds(ctx);
         let bounds = self
-            .saved_position
+            .compact_anchor
             .and_then(|position| select_bounds(&monitor_bounds, self.primary_monitor, position))
             .or_else(|| monitor_bounds.get(self.primary_monitor).copied())
             .or_else(|| monitor_bounds.first().copied());
-        let (initial, bounds) = match self.saved_position {
+        let (initial, bounds) = match self.compact_anchor {
             Some(position) => (position, bounds),
             None => {
                 let bounds = bounds.unwrap_or_else(|| Self::fallback_bounds(ctx));
@@ -213,6 +289,7 @@ impl FloatingApp {
             clamped.x as f32,
             clamped.y as f32,
         )));
+        self.compact_anchor = Some(clamped);
         self.positioned = true;
     }
 
@@ -220,24 +297,31 @@ impl FloatingApp {
         let Some(rect) = ctx.input(|input| input.viewport().outer_rect) else {
             return;
         };
-        let observed = Position {
+        let viewport_position = Position {
             x: rect.min.x.round() as i32,
             y: rect.min.y.round() as i32,
+        };
+        let observed = if let Some(layout) = self.expanded_layout {
+            Position {
+                x: viewport_position.x.saturating_add(layout.ball_offset.x),
+                y: viewport_position.y.saturating_add(layout.ball_offset.y),
+            }
+        } else {
+            viewport_position
         };
         let now_ms = self.started_at.elapsed().as_millis() as u64;
         let Some(settled) = self.position_tracker.observe(observed, now_ms) else {
             return;
         };
-        let size = window_size(self.expanded);
-        let position = self.clamped_position(ctx, settled, size);
-        if position != settled {
+        let position = self.clamped_position(ctx, settled, BALL_SIZE);
+        if !self.expanded && position != settled {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 position.x as f32,
                 position.y as f32,
             )));
         }
         if self.config.save(position).is_ok() {
-            self.saved_position = Some(position);
+            self.compact_anchor = Some(position);
         }
     }
 
@@ -301,15 +385,19 @@ impl FloatingApp {
     }
 
     fn expanded_card(&mut self, ctx: &egui::Context) {
+        let card_origin = self
+            .expanded_layout
+            .map(|layout| layout.card_origin)
+            .unwrap_or(Position { x: 88, y: 0 });
         egui::Area::new(egui::Id::new("quota-card"))
-            .fixed_pos(egui::pos2(48.0, 12.0))
+            .fixed_pos(egui::pos2(card_origin.x as f32, card_origin.y as f32))
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(30, 41, 59))
                     .rounding(16.0)
                     .inner_margin(16.0)
                     .show(ui, |ui| {
-                        ui.set_width(280.0);
+                        ui.set_width(240.0);
                         ui.horizontal(|ui| {
                             ui.heading("Codex 额度");
                             ui.with_layout(
@@ -391,17 +479,19 @@ impl eframe::App for FloatingApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
-                let ball = egui::Rect::from_min_size(ui.min_rect().min, BALL_SIZE);
+                let ball_offset = self
+                    .expanded_layout
+                    .map(|layout| layout.ball_offset)
+                    .unwrap_or(Position { x: 0, y: 0 });
+                let ball = egui::Rect::from_min_size(
+                    ui.min_rect().min + egui::vec2(ball_offset.x as f32, ball_offset.y as f32),
+                    BALL_SIZE,
+                );
                 let response =
                     ui.interact(ball, ui.id().with("ball"), egui::Sense::click_and_drag());
                 self.paint_ball(ui, ball);
                 if response.drag_started() {
-                    let current =
-                        ctx.input(|input| input.viewport().outer_rect)
-                            .map(|rect| Position {
-                                x: rect.min.x.round() as i32,
-                                y: rect.min.y.round() as i32,
-                            });
+                    let current = self.compact_anchor;
                     self.position_tracker
                         .start(current, self.started_at.elapsed().as_millis() as u64);
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
