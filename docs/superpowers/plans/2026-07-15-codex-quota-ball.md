@@ -62,7 +62,7 @@
 
 - [ ] **Step 1: Write the failing quota-domain tests**
 
-Create `Cargo.toml`, `src/lib.rs`, and `tests/quota_tests.rs`:
+Create `Cargo.toml`, `src/lib.rs`, `src/quota.rs`, and `tests/quota_tests.rs`. The quota module is an API-only RED skeleton so the tests compile and fail at runtime for the missing behavior:
 
 ```toml
 [package]
@@ -83,6 +83,42 @@ serde_json = "1"
 ```rust
 // src/lib.rs
 pub mod quota;
+```
+
+```rust
+// src/quota.rs — RED skeleton, replaced in Step 3
+use serde_json::Value;
+use std::fmt;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaWindow {
+    pub remaining_percent: u8,
+    pub resets_at: Option<i64>,
+    pub window_duration_mins: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    pub primary: Option<QuotaWindow>,
+    pub secondary: Option<QuotaWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingTone { Green, Yellow, Red, Gray }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaParseError(&'static str);
+
+impl fmt::Display for QuotaParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.0) }
+}
+
+impl std::error::Error for QuotaParseError {}
+
+pub fn remaining_percent(_: i64) -> u8 { unimplemented!("quota conversion") }
+pub fn ring_tone(_: Option<u8>) -> RingTone { unimplemented!("ring tone") }
+pub fn format_reset_time(_: Option<i64>) -> String { unimplemented!("reset formatting") }
+pub fn parse_quota_response(_: &Value) -> Result<QuotaSnapshot, QuotaParseError> { unimplemented!("quota parsing") }
 ```
 
 ```rust
@@ -156,7 +192,7 @@ fn invalid_timestamp_is_displayed_as_unavailable() {
 
 Run: `cargo test --test quota_tests -v`
 
-Expected: FAIL because `src/quota.rs` and the imported quota symbols do not exist.
+Expected: tests compile, then FAIL with `not implemented: quota conversion`.
 
 - [ ] **Step 3: Implement the quota domain and tolerant response decoder**
 
@@ -279,7 +315,29 @@ git commit -m "feat: add quota response domain"
 
 - [ ] **Step 1: Write failing position and persistence tests**
 
-Append `pub mod config;` to `src/lib.rs` and create `tests/config_tests.rs`:
+Append `pub mod config;` to `src/lib.rs`, create the following API-only RED skeleton as `src/config.rs`, and create `tests/config_tests.rs`:
+
+```rust
+// src/config.rs — RED skeleton, replaced in Step 3
+use serde::{Deserialize, Serialize};
+use std::{io, path::PathBuf};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Position { pub x: i32, pub y: i32 }
+
+#[derive(Clone, Debug)]
+pub struct ConfigStore { path: PathBuf }
+
+impl ConfigStore {
+    pub fn new(path: PathBuf) -> Self { Self { path } }
+    pub fn default_path() -> Option<PathBuf> { unimplemented!("config path") }
+    pub fn load(&self) -> Option<Position> { unimplemented!("config load") }
+    pub fn save(&self, _: Position) -> io::Result<()> { unimplemented!("config save") }
+}
+
+pub fn default_position(_: i32, _: i32) -> Position { unimplemented!("default position") }
+pub fn clamp_position(_: Position, _: i32, _: i32, _: i32, _: i32) -> Position { unimplemented!("position clamp") }
+```
 
 ```rust
 use codex_quota_ball::config::{clamp_position, default_position, ConfigStore, Position};
@@ -319,7 +377,7 @@ fn default_is_near_upper_right_and_clamp_keeps_window_visible() {
 
 Run: `cargo test --test config_tests -v`
 
-Expected: FAIL because `config` and its types/functions are not implemented.
+Expected: tests compile, then FAIL with `not implemented: config save`.
 
 - [ ] **Step 3: Implement atomic position persistence and geometry helpers**
 
@@ -402,7 +460,40 @@ git commit -m "feat: persist floating window position"
 
 - [ ] **Step 1: Add a deterministic fake app-server and failing protocol tests**
 
-Append `pub mod codex;` to `src/lib.rs`. Create `tests/fixtures/fake_codex.sh`:
+Append `pub mod codex;` to `src/lib.rs`. Create this API-only RED skeleton as `src/codex.rs`:
+
+```rust
+// src/codex.rs — RED skeleton, replaced in Step 3
+use crate::quota::QuotaSnapshot;
+use std::{fmt, path::PathBuf, time::Duration};
+
+#[derive(Clone, Debug)]
+pub struct CommandSpec { pub program: PathBuf, pub args: Vec<String> }
+
+impl CommandSpec {
+    pub fn new(_: impl Into<PathBuf>) -> Self { unimplemented!("command construction") }
+    pub fn arg(self, _: impl Into<String>) -> Self { unimplemented!("command argument") }
+    pub fn codex() -> Self { unimplemented!("codex command") }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClientError { MissingCodex, NotLoggedIn, Timeout, Process(String), Protocol(String), Server(String) }
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+}
+
+impl std::error::Error for ClientError {}
+
+pub struct CodexClient;
+
+impl CodexClient {
+    pub fn connect(_: CommandSpec, _: Duration) -> Result<Self, ClientError> { unimplemented!("client connect") }
+    pub fn read_quota(&mut self) -> Result<QuotaSnapshot, ClientError> { unimplemented!("quota request") }
+}
+```
+
+Create `tests/fixtures/fake_codex.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -479,7 +570,7 @@ fn times_out_and_reports_child_exit() {
 
 Run: `cargo test --test codex_client_tests -- --test-threads=1`
 
-Expected: FAIL because the `codex` module and client types do not exist.
+Expected: tests compile, then FAIL with `not implemented: command construction`.
 
 - [ ] **Step 3: Implement child lifecycle, handshake, response matching, and error mapping**
 
@@ -645,7 +736,34 @@ git commit -m "feat: read quota from codex app server"
 
 - [ ] **Step 1: Write failing worker and state-reducer tests**
 
-Append `pub mod worker;` to `src/lib.rs` and create `tests/worker_tests.rs`:
+Append `pub mod worker;` to `src/lib.rs`, create this API-only RED skeleton as `src/worker.rs`, and create `tests/worker_tests.rs`:
+
+```rust
+// src/worker.rs — RED skeleton, replaced in Step 3
+use crate::{codex::CommandSpec, quota::QuotaSnapshot};
+use std::{sync::mpsc::Receiver, time::{Duration, SystemTime}};
+
+#[derive(Debug)]
+pub enum WorkerEvent { Started, Finished(Result<QuotaSnapshot, String>) }
+
+pub struct WorkerHandle { pub events: Receiver<WorkerEvent> }
+
+impl WorkerHandle { pub fn request_refresh(&self) { unimplemented!("refresh request") } }
+
+#[derive(Debug, Default)]
+pub struct QuotaViewState {
+    pub snapshot: Option<QuotaSnapshot>,
+    pub refreshing: bool,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub updated_at: Option<SystemTime>,
+}
+
+impl QuotaViewState { pub fn apply(&mut self, _: WorkerEvent) { unimplemented!("state reduction") } }
+
+pub fn spawn_worker() -> WorkerHandle { unimplemented!("worker spawn") }
+pub fn spawn_worker_with(_: CommandSpec, _: Duration, _: Duration) -> WorkerHandle { unimplemented!("worker spawn") }
+```
 
 ```rust
 use codex_quota_ball::{
@@ -696,7 +814,7 @@ fn a_failure_keeps_previous_data_and_marks_it_stale() {
 
 Run: `cargo test --test worker_tests -- --test-threads=1`
 
-Expected: FAIL because the worker module is not implemented.
+Expected: tests compile, then FAIL with `not implemented: command construction`.
 
 - [ ] **Step 3: Implement one background thread with a capacity-one refresh queue**
 
@@ -819,7 +937,18 @@ git commit -m "feat: schedule quota refreshes"
 
 - [ ] **Step 1: Write failing tests for ring geometry and viewport sizes**
 
-Append `pub mod fonts;` and `pub mod ui;` to `src/lib.rs`. Create `tests/ui_tests.rs`:
+Append `pub mod fonts;` and `pub mod ui;` to `src/lib.rs`, create an empty `src/fonts.rs`, create this API-only RED skeleton as `src/ui.rs`, and create `tests/ui_tests.rs`:
+
+```rust
+// src/ui.rs — RED skeleton, replaced in Step 4
+use eframe::egui;
+
+pub const BALL_SIZE: egui::Vec2 = egui::vec2(88.0, 88.0);
+pub const EXPANDED_SIZE: egui::Vec2 = egui::vec2(360.0, 260.0);
+
+pub fn window_size(_: bool) -> egui::Vec2 { unimplemented!("window size") }
+pub fn ring_points(_: egui::Pos2, _: f32, _: u8) -> Vec<egui::Pos2> { unimplemented!("ring geometry") }
+```
 
 ```rust
 use codex_quota_ball::ui::{ring_points, window_size, BALL_SIZE, EXPANDED_SIZE};
@@ -845,7 +974,7 @@ fn compact_and_expanded_sizes_are_fixed() {
 
 Run: `cargo test --test ui_tests -v`
 
-Expected: FAIL because the UI module and exported geometry helpers do not exist.
+Expected: tests compile, then FAIL with `not implemented: ring geometry`.
 
 - [ ] **Step 3: Implement CJK font loading**
 
