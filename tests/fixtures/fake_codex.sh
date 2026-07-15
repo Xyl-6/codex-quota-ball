@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 scenario="${FAKE_SCENARIO:-success}"
+if [[ "${1:-}" == "--version" ]]; then
+  if [[ "$scenario" == "version-hang" ]]; then
+    exec sleep 2
+  fi
+  printf '%s\n' 'fake-codex 1.2.3'
+  exit 0
+fi
 while IFS= read -r line; do
   if [[ "$line" == *'"method":"initialize"'* ]]; then
     printf '%s\n' '{"id":1,"result":{"userAgent":"fake/0.1","codexHome":"/tmp/fake","platformFamily":"unix","platformOs":"linux"}}'
@@ -12,8 +19,9 @@ while IFS= read -r line; do
         ;;
       signed-out) printf '%s\n' '{"id":2,"error":{"code":-32603,"message":"not logged in"}}' ;;
       malformed) printf '%s\n' '{broken-json' ;;
-      timeout) sleep 2 ;;
+      timeout) exec sleep 2 ;;
       exit) exit 7 ;;
+      version-hang) printf '%s\n' '{"id":2,"result":{}}' ;;
     esac
   fi
 done

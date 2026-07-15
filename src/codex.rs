@@ -2,7 +2,7 @@ use crate::quota::{parse_quota_response, QuotaSnapshot};
 use serde_json::{json, Value};
 use std::{
     fmt,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -73,14 +73,7 @@ pub struct CodexClient {
 
 impl CodexClient {
     pub fn connect(spec: CommandSpec, timeout: Duration) -> Result<Self, ClientError> {
-        let version = Command::new(&spec.program)
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|version| !version.is_empty())
-            .unwrap_or_else(|| "unknown version".to_owned());
+        let version = probe_version(&spec.program, timeout);
         let mut child = Command::new(&spec.program)
             .args(&spec.args)
             .stdin(Stdio::piped())
@@ -159,22 +152,26 @@ impl CodexClient {
     }
 
     fn recv_for_id(&mut self, id: u64) -> Result<Value, ClientError> {
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(ClientError::Timeout)?;
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
             if wait.is_zero() {
                 return Err(ClientError::Timeout);
             }
-            let value = self
-                .messages
-                .recv_timeout(wait)
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => ClientError::Timeout,
-                    mpsc::RecvTimeoutError::Disconnected => {
-                        ClientError::Process("stdout closed".into())
-                    }
-                })?
-                .map_err(ClientError::Protocol)?;
+            let value = match self.messages.recv_timeout(wait) {
+                Ok(value) => value.map_err(ClientError::Protocol)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(ClientError::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let message = match self.child.try_wait() {
+                        Ok(Some(status)) => format!("stdout closed ({status})"),
+                        Ok(None) => "stdout closed".to_owned(),
+                        Err(error) => format!("stdout closed ({error})"),
+                    };
+                    return Err(ClientError::Process(message));
+                }
+            };
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -193,6 +190,60 @@ impl CodexClient {
                 );
             }
             return Ok(value);
+        }
+    }
+}
+
+fn probe_version(program: &PathBuf, timeout: Duration) -> String {
+    let mut child = match Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return "unknown version".to_owned(),
+    };
+    let deadline = match Instant::now().checked_add(timeout) {
+        Some(deadline) => deadline,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return "unknown version".to_owned();
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return "unknown version".to_owned();
+                }
+                let mut version = String::new();
+                if child
+                    .stdout
+                    .take()
+                    .and_then(|mut stdout| stdout.read_to_string(&mut version).ok())
+                    .is_some()
+                {
+                    let version = version.trim();
+                    if !version.is_empty() {
+                        return version.to_owned();
+                    }
+                }
+                return "unknown version".to_owned();
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "unknown version".to_owned();
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
 use codex_quota_ball::codex::{ClientError, CodexClient, CommandSpec};
-use std::{path::PathBuf, sync::Mutex, time::Duration};
+use std::{path::PathBuf, sync::Mutex, time::Duration, time::Instant};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -7,10 +7,7 @@ fn fake(scenario: &str) -> (std::sync::MutexGuard<'static, ()>, CommandSpec) {
     let guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("FAKE_SCENARIO", scenario);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_codex.sh");
-    (
-        guard,
-        CommandSpec::new("bash").arg(script.to_string_lossy()),
-    )
+    (guard, CommandSpec::new(script))
 }
 
 #[test]
@@ -43,17 +40,41 @@ fn rejects_malformed_output_without_panicking() {
 }
 
 #[test]
-fn times_out_and_reports_child_exit() {
+fn times_out_and_reaps_the_blocking_process() {
     let (_guard, command) = fake("timeout");
     let mut client = CodexClient::connect(command, Duration::from_millis(50)).unwrap();
     assert!(matches!(client.read_quota(), Err(ClientError::Timeout)));
     drop(client);
-    std::env::set_var("FAKE_SCENARIO", "exit");
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_codex.sh");
-    let mut exited = CodexClient::connect(
-        CommandSpec::new("bash").arg(script.to_string_lossy()),
-        Duration::from_secs(1),
-    )
-    .unwrap();
-    assert!(matches!(exited.read_quota(), Err(ClientError::Process(_))));
+}
+
+#[test]
+fn reports_child_exit_status_when_stdout_closes() {
+    let (_guard, command) = fake("exit");
+    let mut client = CodexClient::connect(command, Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        client.read_quota(),
+        Err(ClientError::Process(message)) if message.contains("exit status: 7")
+    ));
+}
+
+#[test]
+fn bounds_version_probe_and_reports_unknown_version() {
+    let (_guard, command) = fake("version-hang");
+    let started = Instant::now();
+    let mut client = CodexClient::connect(command, Duration::from_millis(50)).unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(
+        client.read_quota(),
+        Err(ClientError::Protocol(message)) if message.contains("unknown version")
+    ));
+}
+
+#[test]
+fn duration_max_returns_an_error_without_panicking() {
+    let (_guard, command) = fake("success");
+    assert!(matches!(
+        CodexClient::connect(command, Duration::MAX),
+        Err(ClientError::Timeout)
+    ));
 }
