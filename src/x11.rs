@@ -37,7 +37,33 @@ pub fn clamp_to_bounds(
     }
 }
 
+pub fn clamp_to_known_bounds(
+    position: Position,
+    bounds: Option<Bounds>,
+    window_width: i32,
+    window_height: i32,
+) -> Position {
+    bounds.map_or(position, |bounds| {
+        clamp_to_bounds(position, bounds, window_width, window_height)
+    })
+}
+
 impl Bounds {
+    pub fn to_logical(self, pixels_per_point: f32) -> Self {
+        let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
+        let logical = |value: i32| (value as f64 / scale as f64).round() as i32;
+        Self {
+            x: logical(self.x),
+            y: logical(self.y),
+            width: logical(self.width).max(1),
+            height: logical(self.height).max(1),
+        }
+    }
+
     fn contains(self, point: Position) -> bool {
         point.x >= self.x
             && point.y >= self.y

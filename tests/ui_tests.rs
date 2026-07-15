@@ -3,7 +3,7 @@ use codex_quota_ball::{
     ui::{
         concise_error, ring_points, window_size, PositionSettleTracker, BALL_SIZE, EXPANDED_SIZE,
     },
-    x11::{clamp_to_bounds, select_bounds, Bounds},
+    x11::{clamp_to_bounds, clamp_to_known_bounds, select_bounds, Bounds},
 };
 use eframe::egui;
 
@@ -85,6 +85,55 @@ fn monitor_selection_falls_back_to_primary() {
         Some(monitors[0])
     );
     assert_eq!(select_bounds(&[], 0, Position { x: 0, y: 0 }), None);
+}
+
+#[test]
+fn physical_monitor_bounds_convert_to_logical_points_before_clamping() {
+    let primary = Bounds {
+        x: 0,
+        y: 0,
+        width: 3840,
+        height: 2160,
+    }
+    .to_logical(2.0);
+    let left = Bounds {
+        x: -3840,
+        y: -200,
+        width: 3840,
+        height: 2160,
+    }
+    .to_logical(2.0);
+
+    assert_eq!(
+        primary,
+        Bounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }
+    );
+    assert_eq!(left.x, -1920);
+    assert_eq!(left.y, -100);
+    assert_eq!(
+        clamp_to_bounds(Position { x: 1800, y: 1000 }, primary, 360, 260),
+        Position { x: 1560, y: 820 }
+    );
+}
+
+#[test]
+fn monitor_scale_defaults_to_one_and_unknown_bounds_preserve_position() {
+    let physical = Bounds {
+        x: -1920,
+        y: 0,
+        width: 1920,
+        height: 1080,
+    };
+    assert_eq!(physical.to_logical(0.0), physical);
+    assert_eq!(physical.to_logical(f32::NAN), physical);
+
+    let current = Position { x: -1600, y: 80 };
+    assert_eq!(clamp_to_known_bounds(current, None, 360, 260), current);
 }
 
 #[test]

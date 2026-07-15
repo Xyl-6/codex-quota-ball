@@ -2,7 +2,7 @@ use crate::{
     config::{ConfigStore, Position},
     quota::{format_reset_time, ring_tone, QuotaWindow, RingTone},
     worker::{QuotaViewState, WorkerHandle},
-    x11::{clamp_to_bounds, query_monitor_bounds, select_bounds, Bounds},
+    x11::{clamp_to_known_bounds, query_monitor_bounds, select_bounds, Bounds},
 };
 use eframe::egui;
 use std::time::Instant;
@@ -127,9 +127,18 @@ impl FloatingApp {
         }
     }
 
-    fn bounds_for(&self, ctx: &egui::Context, position: Position) -> Bounds {
-        select_bounds(&self.monitor_bounds, self.primary_monitor, position)
-            .unwrap_or_else(|| Self::fallback_bounds(ctx))
+    fn logical_monitor_bounds(&self, ctx: &egui::Context) -> Vec<Bounds> {
+        let pixels_per_point = ctx.input(|input| {
+            input
+                .viewport()
+                .native_pixels_per_point
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .unwrap_or(1.0)
+        });
+        self.monitor_bounds
+            .iter()
+            .map(|bounds| bounds.to_logical(pixels_per_point))
+            .collect()
     }
 
     fn clamped_position(
@@ -138,9 +147,10 @@ impl FloatingApp {
         position: Position,
         size: egui::Vec2,
     ) -> Position {
-        clamp_to_bounds(
+        let bounds = self.logical_monitor_bounds(ctx);
+        clamp_to_known_bounds(
             position,
-            self.bounds_for(ctx, position),
+            select_bounds(&bounds, self.primary_monitor, position),
             size.x.round() as i32,
             size.y.round() as i32,
         )
@@ -176,21 +186,29 @@ impl FloatingApp {
         if self.positioned {
             return;
         }
+        let monitor_bounds = self.logical_monitor_bounds(ctx);
         let bounds = self
             .saved_position
-            .and_then(|position| {
-                select_bounds(&self.monitor_bounds, self.primary_monitor, position)
-            })
-            .or_else(|| self.monitor_bounds.get(self.primary_monitor).copied())
-            .or_else(|| self.monitor_bounds.first().copied())
-            .unwrap_or_else(|| Self::fallback_bounds(ctx));
-        let initial = self.saved_position.unwrap_or(Position {
-            x: bounds
-                .x
-                .saturating_add((bounds.width - BALL_SIZE.x as i32 - 24).max(0)),
-            y: bounds.y.saturating_add(24),
-        });
-        let clamped = clamp_to_bounds(initial, bounds, BALL_SIZE.x as i32, BALL_SIZE.y as i32);
+            .and_then(|position| select_bounds(&monitor_bounds, self.primary_monitor, position))
+            .or_else(|| monitor_bounds.get(self.primary_monitor).copied())
+            .or_else(|| monitor_bounds.first().copied());
+        let (initial, bounds) = match self.saved_position {
+            Some(position) => (position, bounds),
+            None => {
+                let bounds = bounds.unwrap_or_else(|| Self::fallback_bounds(ctx));
+                (
+                    Position {
+                        x: bounds
+                            .x
+                            .saturating_add((bounds.width - BALL_SIZE.x as i32 - 24).max(0)),
+                        y: bounds.y.saturating_add(24),
+                    },
+                    Some(bounds),
+                )
+            }
+        };
+        let clamped =
+            clamp_to_known_bounds(initial, bounds, BALL_SIZE.x as i32, BALL_SIZE.y as i32);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             clamped.x as f32,
             clamped.y as f32,
