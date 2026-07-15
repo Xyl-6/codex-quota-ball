@@ -1,12 +1,54 @@
+use chrono::NaiveDate;
 use codex_quota_ball::{
     config::Position,
-    ui::{concise_error, ring_points, PositionSettleTracker},
+    morph::MorphPhase,
+    ui::{
+        concise_error, heat_cell_rect, heat_tooltip, ring_points, should_collapse,
+        should_drive_viewport_position, PositionSettleTracker,
+    },
+    usage::HeatCell,
     x11::{
         clamp_to_bounds, clamp_to_known_bounds, parse_workarea_rects, resolve_workareas,
         select_bounds, Bounds,
     },
 };
 use eframe::egui;
+
+#[test]
+fn heat_cells_advance_days_vertically_and_weeks_horizontally() {
+    let origin = egui::pos2(20.0, 40.0);
+    assert_eq!(heat_cell_rect(origin, 0).min, egui::pos2(20.0, 40.0));
+    assert_eq!(heat_cell_rect(origin, 1).min, egui::pos2(20.0, 49.0));
+    assert_eq!(heat_cell_rect(origin, 7).min, egui::pos2(29.0, 40.0));
+    assert_eq!(heat_cell_rect(origin, 181).size(), egui::vec2(7.0, 7.0));
+}
+
+#[test]
+fn escape_or_focus_loss_collapses_only_an_open_target() {
+    assert!(should_collapse(true, true, false));
+    assert!(should_collapse(true, false, true));
+    assert!(!should_collapse(false, true, true));
+    assert!(!should_collapse(true, false, false));
+}
+
+#[test]
+fn expanded_drag_temporarily_owns_viewport_position() {
+    assert!(!should_drive_viewport_position(MorphPhase::Expanded, true));
+    assert!(should_drive_viewport_position(MorphPhase::Expanded, false));
+    assert!(should_drive_viewport_position(MorphPhase::Expanding, true));
+    assert!(should_drive_viewport_position(MorphPhase::Collapsing, true));
+}
+
+#[test]
+fn token_tooltip_contains_exact_date_and_grouped_count() {
+    let cell = HeatCell {
+        date: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(),
+        tokens: 2_386_420,
+        level: 3,
+        future: false,
+    };
+    assert_eq!(heat_tooltip(&cell), "2026-07-15\n使用 2,386,420 tokens");
+}
 
 #[test]
 fn ring_geometry_handles_empty_half_and_full_values() {

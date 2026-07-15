@@ -1,103 +1,49 @@
 use crate::{
     config::{ConfigStore, Position},
-    quota::{format_reset_time, ring_tone, QuotaWindow, RingTone},
-    worker::{QuotaViewState, WorkerHandle},
+    morph::{
+        morph_placement, origin_for_size, reflow_expanded_drag, MorphAnimation, MorphPhase,
+        MorphPlacement, COMPACT_SIZE,
+    },
+    quota::{format_reset_time, ring_tone, weekly_window, QuotaWindow, RingTone},
+    usage::{format_tokens, heatmap_cells, month_labels, HeatCell},
+    worker::{DashboardViewState, SectionState, WorkerHandle},
     x11::{clamp_to_known_bounds, query_monitor_bounds, select_bounds, Bounds},
 };
+use chrono::Local;
 use eframe::egui;
 use std::time::Instant;
 
-pub const BALL_SIZE: egui::Vec2 = egui::vec2(88.0, 88.0);
-pub const EXPANDED_SIZE: egui::Vec2 = egui::vec2(360.0, 260.0);
-pub const CARD_WIDTH: i32 = 272;
+pub const HEAT_CELL: f32 = 7.0;
+pub const HEAT_GAP: f32 = 2.0;
 pub const POSITION_SETTLE_MS: u64 = 500;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExpandedLayout {
-    pub viewport_origin: Position,
-    pub ball_offset: Position,
-    pub card_origin: Position,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExpandedDragPlacement {
-    pub compact_anchor: Position,
-    pub layout: ExpandedLayout,
-}
-
-pub fn expanded_layout(anchor: Position, workarea: Bounds) -> ExpandedLayout {
-    let viewport_width = EXPANDED_SIZE.x as i32;
-    let viewport_height = EXPANDED_SIZE.y as i32;
-    let ball_width = BALL_SIZE.x as i32;
-    let ball_height = BALL_SIZE.y as i32;
-    let right = workarea.x.saturating_add(workarea.width);
-    let card_on_right = anchor.x.saturating_add(viewport_width) <= right;
-    let desired_x = if card_on_right {
-        anchor.x
-    } else {
-        anchor.x.saturating_sub(CARD_WIDTH)
-    };
-    let viewport_origin = clamp_to_known_bounds(
-        Position {
-            x: desired_x,
-            y: anchor.y,
-        },
-        Some(workarea),
-        viewport_width,
-        viewport_height,
-    );
-    let ball_offset = Position {
-        x: if card_on_right { 0 } else { CARD_WIDTH },
-        y: (anchor.y - viewport_origin.y).clamp(0, viewport_height - ball_height),
-    };
-    let card_origin = Position {
-        x: if card_on_right { ball_width } else { 0 },
-        y: 0,
-    };
-    ExpandedLayout {
-        viewport_origin,
-        ball_offset,
-        card_origin,
-    }
-}
-
-pub fn compact_anchor_from_viewport(
-    viewport_origin: Position,
-    ball_offset: Position,
-    workarea: Bounds,
-) -> Position {
-    clamp_to_known_bounds(
-        Position {
-            x: viewport_origin.x.saturating_add(ball_offset.x),
-            y: viewport_origin.y.saturating_add(ball_offset.y),
-        },
-        Some(workarea),
-        BALL_SIZE.x as i32,
-        BALL_SIZE.y as i32,
+pub fn heat_cell_rect(origin: egui::Pos2, index: usize) -> egui::Rect {
+    let week = index / 7;
+    let day = index % 7;
+    egui::Rect::from_min_size(
+        origin
+            + egui::vec2(
+                week as f32 * (HEAT_CELL + HEAT_GAP),
+                day as f32 * (HEAT_CELL + HEAT_GAP),
+            ),
+        egui::vec2(HEAT_CELL, HEAT_CELL),
     )
 }
 
-pub fn reflow_expanded_drag(
-    viewport_origin: Position,
-    ball_offset: Position,
-    workareas: &[Bounds],
-    primary_monitor: usize,
-) -> Option<ExpandedDragPlacement> {
-    let observed_anchor = Position {
-        x: viewport_origin.x.saturating_add(ball_offset.x),
-        y: viewport_origin.y.saturating_add(ball_offset.y),
-    };
-    let workarea = select_bounds(workareas, primary_monitor, observed_anchor)?;
-    let compact_anchor = clamp_to_known_bounds(
-        observed_anchor,
-        Some(workarea),
-        BALL_SIZE.x as i32,
-        BALL_SIZE.y as i32,
-    );
-    Some(ExpandedDragPlacement {
-        compact_anchor,
-        layout: expanded_layout(compact_anchor, workarea),
-    })
+pub fn should_collapse(target_expanded: bool, escape: bool, focus_lost: bool) -> bool {
+    target_expanded && (escape || focus_lost)
+}
+
+pub fn should_drive_viewport_position(phase: MorphPhase, drag_active: bool) -> bool {
+    phase != MorphPhase::Expanded || !drag_active
+}
+
+pub fn heat_tooltip(cell: &HeatCell) -> String {
+    format!(
+        "{}\n使用 {} tokens",
+        cell.date.format("%Y-%m-%d"),
+        format_tokens(cell.tokens)
+    )
 }
 
 #[derive(Default)]
@@ -159,14 +105,6 @@ pub fn concise_error(error: &str, max_chars: usize) -> String {
         .collect()
 }
 
-pub fn window_size(expanded: bool) -> egui::Vec2 {
-    if expanded {
-        EXPANDED_SIZE
-    } else {
-        BALL_SIZE
-    }
-}
-
 pub fn ring_points(center: egui::Pos2, radius: f32, remaining: u8) -> Vec<egui::Pos2> {
     if remaining == 0 {
         return Vec::new();
@@ -181,13 +119,36 @@ pub fn ring_points(center: egui::Pos2, radius: f32, remaining: u8) -> Vec<egui::
         .collect()
 }
 
+fn faded(color: egui::Color32, alpha: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (color.a() as f32 * alpha.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
+fn section_status<T>(section: &SectionState<T>, refreshing: bool) -> String {
+    if section.stale {
+        "数据可能已过期".to_owned()
+    } else if refreshing {
+        "正在更新…".to_owned()
+    } else {
+        section
+            .updated_at
+            .and_then(|time| time.elapsed().ok())
+            .map(|elapsed| format!("{} 分钟前更新", elapsed.as_secs() / 60))
+            .unwrap_or_else(|| "等待首次更新".to_owned())
+    }
+}
+
 pub struct FloatingApp {
     worker: WorkerHandle,
-    state: QuotaViewState,
+    state: DashboardViewState,
     config: ConfigStore,
     compact_anchor: Option<Position>,
-    expanded: bool,
-    expanded_layout: Option<ExpandedLayout>,
+    morph: MorphAnimation,
+    placement: Option<MorphPlacement>,
     positioned: bool,
     monitor_bounds: Vec<Bounds>,
     primary_monitor: usize,
@@ -201,17 +162,21 @@ impl FloatingApp {
         let (monitor_bounds, primary_monitor) = query_monitor_bounds().unwrap_or_default();
         Self {
             worker,
-            state: QuotaViewState::default(),
+            state: DashboardViewState::default(),
             config,
             compact_anchor,
-            expanded: false,
-            expanded_layout: None,
+            morph: MorphAnimation::default(),
+            placement: None,
             positioned: false,
             monitor_bounds,
             primary_monitor,
             position_tracker: PositionSettleTracker::default(),
             started_at: Instant::now(),
         }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
     }
 
     fn fallback_bounds(ctx: &egui::Context) -> Bounds {
@@ -240,92 +205,65 @@ impl FloatingApp {
             .collect()
     }
 
-    fn clamped_position(
-        &self,
-        ctx: &egui::Context,
-        position: Position,
-        size: egui::Vec2,
-    ) -> Position {
+    fn clamped_compact_position(&self, ctx: &egui::Context, position: Position) -> Position {
         let bounds = self.logical_monitor_bounds(ctx);
         clamp_to_known_bounds(
             position,
             select_bounds(&bounds, self.primary_monitor, position),
-            size.x.round() as i32,
-            size.y.round() as i32,
+            COMPACT_SIZE.x.round() as i32,
+            COMPACT_SIZE.y.round() as i32,
         )
     }
 
-    fn set_expanded(&mut self, ctx: &egui::Context, expanded: bool) {
-        if self.expanded == expanded {
+    fn outer_position(ctx: &egui::Context) -> Option<Position> {
+        ctx.input(|input| input.viewport().outer_rect)
+            .map(|rect| Position {
+                x: rect.min.x.round() as i32,
+                y: rect.min.y.round() as i32,
+            })
+    }
+
+    fn begin_transition(&mut self, ctx: &egui::Context, expanded: bool) {
+        if self.morph.target_expanded() == expanded {
             return;
         }
-        if self.expanded && !expanded && self.position_tracker.is_active() {
+        if !expanded && self.position_tracker.is_active() {
             self.commit_expanded_position(ctx, false);
             self.position_tracker.stop();
         }
-        let size = window_size(expanded);
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        let outer_position = ctx
-            .input(|input| input.viewport().outer_rect)
-            .map(|outer| Position {
-                x: outer.min.x.round() as i32,
-                y: outer.min.y.round() as i32,
-            });
         if expanded {
-            let anchor = outer_position.or(self.compact_anchor);
-            if let Some(anchor) = anchor {
-                let anchor = self.clamped_position(ctx, anchor, BALL_SIZE);
-                self.compact_anchor = Some(anchor);
-                let bounds = self.logical_monitor_bounds(ctx);
-                let workarea = select_bounds(&bounds, self.primary_monitor, anchor)
-                    .unwrap_or_else(|| Self::fallback_bounds(ctx));
-                let layout = expanded_layout(anchor, workarea);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                    layout.viewport_origin.x as f32,
-                    layout.viewport_origin.y as f32,
-                )));
-                self.expanded_layout = Some(layout);
-            }
+            let anchor = Self::outer_position(ctx)
+                .or(self.compact_anchor)
+                .unwrap_or(Position { x: 0, y: 0 });
+            let anchor = self.clamped_compact_position(ctx, anchor);
+            let bounds = self.logical_monitor_bounds(ctx);
+            let workarea = select_bounds(&bounds, self.primary_monitor, anchor)
+                .unwrap_or_else(|| Self::fallback_bounds(ctx));
+            let placement = morph_placement(anchor, workarea);
+            self.compact_anchor = Some(placement.compact_anchor);
+            self.placement = Some(placement);
             self.worker.request_refresh();
-        } else if let Some(anchor) = self.compact_anchor {
-            let position = self.clamped_position(ctx, anchor, BALL_SIZE);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                position.x as f32,
-                position.y as f32,
-            )));
-            self.compact_anchor = Some(position);
-            self.expanded_layout = None;
         }
-        self.expanded = expanded;
+        self.morph.set_expanded(expanded, self.now_ms());
+        ctx.request_repaint();
     }
 
     fn commit_expanded_position(&mut self, ctx: &egui::Context, reposition: bool) {
-        let Some(current_layout) = self.expanded_layout else {
+        let (Some(current), Some(origin)) = (self.placement, Self::outer_position(ctx)) else {
             return;
-        };
-        let Some(rect) = ctx.input(|input| input.viewport().outer_rect) else {
-            return;
-        };
-        let viewport_origin = Position {
-            x: rect.min.x.round() as i32,
-            y: rect.min.y.round() as i32,
         };
         let workareas = self.logical_monitor_bounds(ctx);
-        let Some(placement) = reflow_expanded_drag(
-            viewport_origin,
-            current_layout.ball_offset,
-            &workareas,
-            self.primary_monitor,
-        ) else {
+        let Some(placement) =
+            reflow_expanded_drag(origin, current.growth, &workareas, self.primary_monitor)
+        else {
             return;
         };
-
         self.compact_anchor = Some(placement.compact_anchor);
-        self.expanded_layout = Some(placement.layout);
-        if reposition && placement.layout.viewport_origin != viewport_origin {
+        self.placement = Some(placement);
+        if reposition && placement.expanded_origin != origin {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                placement.layout.viewport_origin.x as f32,
-                placement.layout.viewport_origin.y as f32,
+                placement.expanded_origin.x as f32,
+                placement.expanded_origin.y as f32,
             )));
         }
         let _ = self.config.save(placement.compact_anchor);
@@ -349,15 +287,19 @@ impl FloatingApp {
                     Position {
                         x: bounds
                             .x
-                            .saturating_add((bounds.width - BALL_SIZE.x as i32 - 24).max(0)),
+                            .saturating_add((bounds.width - COMPACT_SIZE.x as i32 - 24).max(0)),
                         y: bounds.y.saturating_add(24),
                     },
                     Some(bounds),
                 )
             }
         };
-        let clamped =
-            clamp_to_known_bounds(initial, bounds, BALL_SIZE.x as i32, BALL_SIZE.y as i32);
+        let clamped = clamp_to_known_bounds(
+            initial,
+            bounds,
+            COMPACT_SIZE.x as i32,
+            COMPACT_SIZE.y as i32,
+        );
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             clamped.x as f32,
             clamped.y as f32,
@@ -367,47 +309,37 @@ impl FloatingApp {
     }
 
     fn track_current_position(&mut self, ctx: &egui::Context) {
-        let Some(rect) = ctx.input(|input| input.viewport().outer_rect) else {
+        let Some(position) = Self::outer_position(ctx) else {
             return;
         };
-        let viewport_position = Position {
-            x: rect.min.x.round() as i32,
-            y: rect.min.y.round() as i32,
+        let Some(settled) = self.position_tracker.observe(position, self.now_ms()) else {
+            return;
         };
-        let observed = if let Some(layout) = self.expanded_layout {
-            Position {
-                x: viewport_position.x.saturating_add(layout.ball_offset.x),
-                y: viewport_position.y.saturating_add(layout.ball_offset.y),
+        match self.morph.phase() {
+            MorphPhase::Expanded => self.commit_expanded_position(ctx, true),
+            MorphPhase::Collapsed => {
+                let position = self.clamped_compact_position(ctx, settled);
+                if position != settled {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        position.x as f32,
+                        position.y as f32,
+                    )));
+                }
+                if self.config.save(position).is_ok() {
+                    self.compact_anchor = Some(position);
+                }
             }
-        } else {
-            viewport_position
-        };
-        let now_ms = self.started_at.elapsed().as_millis() as u64;
-        let Some(settled) = self.position_tracker.observe(observed, now_ms) else {
-            return;
-        };
-        if self.expanded {
-            self.commit_expanded_position(ctx, true);
-            return;
-        }
-        let position = self.clamped_position(ctx, settled, BALL_SIZE);
-        if !self.expanded && position != settled {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                position.x as f32,
-                position.y as f32,
-            )));
-        }
-        if self.config.save(position).is_ok() {
-            self.compact_anchor = Some(position);
+            MorphPhase::Expanding | MorphPhase::Collapsing => {}
         }
     }
 
-    fn paint_ball(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn paint_compact(&self, ui: &egui::Ui, rect: egui::Rect, alpha: f32) {
         let remaining = self
             .state
-            .snapshot
+            .quota
+            .value
             .as_ref()
-            .and_then(|snapshot| snapshot.primary.as_ref())
+            .and_then(weekly_window)
             .map(|window| window.remaining_percent);
         let color = match ring_tone(remaining) {
             RingTone::Green => egui::Color32::from_rgb(34, 197, 94),
@@ -416,17 +348,17 @@ impl FloatingApp {
             RingTone::Gray => egui::Color32::from_rgb(100, 116, 139),
         };
         let center = rect.center();
-        ui.painter()
-            .circle_filled(center, 35.0, egui::Color32::from_rgb(23, 32, 51));
         ui.painter().circle_stroke(
             center,
             38.0,
-            egui::Stroke::new(7.0, egui::Color32::from_rgb(51, 65, 85)),
+            egui::Stroke::new(7.0, faded(egui::Color32::from_rgb(51, 65, 85), alpha)),
         );
         let points = ring_points(center, 38.0, remaining.unwrap_or(0));
         if points.len() > 1 {
-            ui.painter()
-                .add(egui::Shape::line(points, egui::Stroke::new(7.0, color)));
+            ui.painter().add(egui::Shape::line(
+                points,
+                egui::Stroke::new(7.0, faded(color, alpha)),
+            ));
         }
         let label = remaining
             .map(|value| format!("{value}%"))
@@ -436,105 +368,343 @@ impl FloatingApp {
             egui::Align2::CENTER_CENTER,
             label,
             egui::FontId::proportional(19.0),
-            egui::Color32::WHITE,
+            faded(egui::Color32::WHITE, alpha),
         );
     }
 
-    fn quota_row(ui: &mut egui::Ui, title: &str, window: Option<&QuotaWindow>) {
-        match window {
-            Some(window) => {
-                ui.horizontal(|ui| {
-                    ui.label(title);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.strong(format!("{}%", window.remaining_percent));
-                    });
-                });
-                ui.add(
-                    egui::ProgressBar::new(window.remaining_percent as f32 / 100.0)
-                        .show_percentage(),
+    fn paint_text(
+        ui: &egui::Ui,
+        pos: egui::Pos2,
+        align: egui::Align2,
+        text: impl ToString,
+        size: f32,
+        color: egui::Color32,
+        alpha: f32,
+    ) {
+        ui.painter().text(
+            pos,
+            align,
+            text.to_string(),
+            egui::FontId::proportional(size),
+            faded(color, alpha),
+        );
+    }
+
+    fn paint_weekly(
+        &self,
+        ui: &egui::Ui,
+        origin: egui::Pos2,
+        weekly: Option<&QuotaWindow>,
+        alpha: f32,
+    ) {
+        let white = egui::Color32::from_rgb(226, 232, 240);
+        let muted = egui::Color32::from_rgb(148, 163, 184);
+        Self::paint_text(
+            ui,
+            origin,
+            egui::Align2::LEFT_TOP,
+            "Weekly limits",
+            13.0,
+            white,
+            alpha,
+        );
+        if let Some(window) = weekly {
+            Self::paint_text(
+                ui,
+                origin + egui::vec2(254.0, 0.0),
+                egui::Align2::RIGHT_TOP,
+                format!("{}%", window.remaining_percent),
+                13.0,
+                egui::Color32::WHITE,
+                alpha,
+            );
+            let bar =
+                egui::Rect::from_min_size(origin + egui::vec2(0.0, 20.0), egui::vec2(254.0, 6.0));
+            ui.painter()
+                .rect_filled(bar, 3.0, faded(egui::Color32::from_rgb(51, 65, 85), alpha));
+            let width = bar.width() * window.remaining_percent as f32 / 100.0;
+            if width > 0.0 {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(bar.min, egui::vec2(width, bar.height())),
+                    3.0,
+                    faded(egui::Color32::from_rgb(34, 197, 94), alpha),
                 );
-                ui.small(format!("重置时间 {}", format_reset_time(window.resets_at)));
             }
-            None => {
-                ui.label(format!("{title}：不可用"));
+            Self::paint_text(
+                ui,
+                origin + egui::vec2(0.0, 31.0),
+                egui::Align2::LEFT_TOP,
+                format!("重置时间 {}", format_reset_time(window.resets_at)),
+                10.0,
+                muted,
+                alpha,
+            );
+        } else {
+            Self::paint_text(
+                ui,
+                origin + egui::vec2(0.0, 22.0),
+                egui::Align2::LEFT_TOP,
+                "Weekly limits：不可用",
+                11.0,
+                muted,
+                alpha,
+            );
+        }
+    }
+
+    fn paint_heatmap(&self, ui: &mut egui::Ui, origin: egui::Pos2, alpha: f32, interactive: bool) {
+        let white = egui::Color32::from_rgb(226, 232, 240);
+        let muted = egui::Color32::from_rgb(148, 163, 184);
+        Self::paint_text(
+            ui,
+            origin,
+            egui::Align2::LEFT_TOP,
+            "每日使用强度",
+            13.0,
+            white,
+            alpha,
+        );
+        Self::paint_text(
+            ui,
+            origin + egui::vec2(254.0, 1.0),
+            egui::Align2::RIGHT_TOP,
+            "近 26 周",
+            10.0,
+            muted,
+            alpha,
+        );
+
+        let Some(daily) = self
+            .state
+            .usage
+            .value
+            .as_ref()
+            .and_then(|snapshot| snapshot.daily.as_ref())
+        else {
+            Self::paint_text(
+                ui,
+                origin + egui::vec2(0.0, 35.0),
+                egui::Align2::LEFT_TOP,
+                "Token 历史不可用",
+                11.0,
+                muted,
+                alpha,
+            );
+            return;
+        };
+
+        let cells = heatmap_cells(Local::now().date_naive(), daily);
+        let grid = origin + egui::vec2(22.0, 37.0);
+        for (week, label) in month_labels(&cells) {
+            Self::paint_text(
+                ui,
+                grid + egui::vec2(week as f32 * (HEAT_CELL + HEAT_GAP), -15.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                9.0,
+                muted,
+                alpha,
+            );
+        }
+        for (row, label) in [(1, "一"), (3, "三"), (5, "五")] {
+            Self::paint_text(
+                ui,
+                grid + egui::vec2(-7.0, row as f32 * (HEAT_CELL + HEAT_GAP) + 3.5),
+                egui::Align2::RIGHT_CENTER,
+                label,
+                8.0,
+                muted,
+                alpha,
+            );
+        }
+        let today = Local::now().date_naive();
+        for (index, cell) in cells.iter().enumerate() {
+            if cell.future {
+                continue;
+            }
+            let rect = heat_cell_rect(grid, index);
+            let color = match cell.level {
+                0 => egui::Color32::from_rgb(51, 65, 85),
+                1 => egui::Color32::from_rgb(20, 83, 45),
+                2 => egui::Color32::from_rgb(21, 128, 61),
+                3 => egui::Color32::from_rgb(34, 197, 94),
+                _ => egui::Color32::from_rgb(134, 239, 172),
+            };
+            ui.painter().rect_filled(rect, 1.0, faded(color, alpha));
+            if cell.date == today {
+                ui.painter().rect_stroke(
+                    rect,
+                    1.0,
+                    egui::Stroke::new(1.0, faded(egui::Color32::from_rgb(226, 232, 240), alpha)),
+                );
+            }
+            if interactive {
+                ui.interact(
+                    rect,
+                    ui.id().with(("heat-cell", index)),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(heat_tooltip(cell));
+            }
+        }
+        let legend_y = grid.y + 72.0;
+        Self::paint_text(
+            ui,
+            egui::pos2(grid.x + 147.0, legend_y),
+            egui::Align2::LEFT_CENTER,
+            "少",
+            9.0,
+            muted,
+            alpha,
+        );
+        for level in 0..=4 {
+            let color = match level {
+                0 => egui::Color32::from_rgb(51, 65, 85),
+                1 => egui::Color32::from_rgb(20, 83, 45),
+                2 => egui::Color32::from_rgb(21, 128, 61),
+                3 => egui::Color32::from_rgb(34, 197, 94),
+                _ => egui::Color32::from_rgb(134, 239, 172),
+            };
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(grid.x + 165.0 + level as f32 * 11.0, legend_y - 3.5),
+                    egui::vec2(7.0, 7.0),
+                ),
+                1.0,
+                faded(color, alpha),
+            );
+        }
+        Self::paint_text(
+            ui,
+            egui::pos2(grid.x + 224.0, legend_y),
+            egui::Align2::LEFT_CENTER,
+            "多",
+            9.0,
+            muted,
+            alpha,
+        );
+    }
+
+    fn paint_button(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        id: impl std::hash::Hash,
+        text: &str,
+        enabled: bool,
+        alpha: f32,
+    ) -> egui::Response {
+        let response = ui.interact(
+            rect,
+            ui.id().with(id),
+            if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        let fill = if response.hovered() && enabled {
+            egui::Color32::from_rgb(71, 85, 105)
+        } else {
+            egui::Color32::from_rgb(51, 65, 85)
+        };
+        ui.painter().rect_filled(rect, 5.0, faded(fill, alpha));
+        Self::paint_text(
+            ui,
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            10.0,
+            egui::Color32::from_rgb(226, 232, 240),
+            alpha,
+        );
+        response
+    }
+
+    fn paint_card_content(&mut self, ui: &mut egui::Ui, rect: egui::Rect, alpha: f32) {
+        let interactive = self.morph.phase() == MorphPhase::Expanded;
+        let origin = rect.min + egui::vec2(18.0, 13.0);
+        Self::paint_text(
+            ui,
+            origin,
+            egui::Align2::LEFT_TOP,
+            "Codex 额度",
+            17.0,
+            egui::Color32::WHITE,
+            alpha,
+        );
+        let refresh_rect =
+            egui::Rect::from_min_size(origin + egui::vec2(202.0, -1.0), egui::vec2(52.0, 22.0));
+        if Self::paint_button(
+            ui,
+            refresh_rect,
+            "refresh",
+            "↻ 刷新",
+            interactive && !self.state.refreshing,
+            alpha,
+        )
+        .clicked()
+        {
+            self.worker.request_refresh();
+        }
+        Self::paint_text(
+            ui,
+            origin + egui::vec2(0.0, 24.0),
+            egui::Align2::LEFT_TOP,
+            section_status(&self.state.quota, self.state.refreshing),
+            10.0,
+            egui::Color32::from_rgb(148, 163, 184),
+            alpha,
+        );
+        let weekly = self.state.quota.value.as_ref().and_then(weekly_window);
+        self.paint_weekly(ui, origin + egui::vec2(0.0, 45.0), weekly, alpha);
+        self.paint_heatmap(ui, origin + egui::vec2(0.0, 102.0), alpha, interactive);
+
+        let mut error_y = origin.y + 232.0;
+        if self.state.usage.stale {
+            Self::paint_text(
+                ui,
+                egui::pos2(origin.x, error_y),
+                egui::Align2::LEFT_TOP,
+                "Token 数据可能已过期",
+                9.0,
+                egui::Color32::from_rgb(251, 191, 36),
+                alpha,
+            );
+            error_y += 13.0;
+        }
+        for error in [
+            self.state.quota.error.as_deref(),
+            self.state.usage.error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            Self::paint_text(
+                ui,
+                egui::pos2(origin.x, error_y),
+                egui::Align2::LEFT_TOP,
+                concise_error(error, 42),
+                9.0,
+                egui::Color32::from_rgb(248, 113, 113),
+                alpha,
+            );
+            error_y += 13.0;
+        }
+        if self.state.quota.error.is_some() || self.state.usage.error.is_some() {
+            let retry = egui::Rect::from_min_size(
+                egui::pos2(origin.x + 218.0, origin.y + 229.0),
+                egui::vec2(36.0, 20.0),
+            );
+            if Self::paint_button(ui, retry, "retry", "重试", interactive, alpha).clicked() {
+                self.worker.request_refresh();
             }
         }
     }
 
-    fn expanded_card(&mut self, ctx: &egui::Context) {
-        let card_origin = self
-            .expanded_layout
-            .map(|layout| layout.card_origin)
-            .unwrap_or(Position { x: 88, y: 0 });
-        egui::Area::new(egui::Id::new("quota-card"))
-            .fixed_pos(egui::pos2(card_origin.x as f32, card_origin.y as f32))
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(30, 41, 59))
-                    .rounding(16.0)
-                    .inner_margin(16.0)
-                    .show(ui, |ui| {
-                        ui.set_width(240.0);
-                        ui.horizontal(|ui| {
-                            ui.heading("Codex 额度");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_enabled(
-                                            !self.state.refreshing,
-                                            egui::Button::new("↻ 刷新"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.worker.request_refresh();
-                                    }
-                                },
-                            );
-                        });
-                        let status = if self.state.stale {
-                            "数据可能已过期".to_owned()
-                        } else if self.state.refreshing {
-                            "正在更新…".to_owned()
-                        } else {
-                            self.state
-                                .updated_at
-                                .and_then(|time| time.elapsed().ok())
-                                .map(|elapsed| format!("{} 分钟前更新", elapsed.as_secs() / 60))
-                                .unwrap_or_else(|| "等待首次更新".to_owned())
-                        };
-                        ui.small(status);
-                        ui.add_space(10.0);
-                        let primary = self
-                            .state
-                            .snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.primary.as_ref());
-                        let secondary = self
-                            .state
-                            .snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.secondary.as_ref());
-                        Self::quota_row(ui, "短周期窗口", primary);
-                        ui.add_space(10.0);
-                        Self::quota_row(ui, "周周期窗口", secondary);
-                        if let Some(error) = &self.state.error {
-                            ui.horizontal(|ui| {
-                                if ui.button("重试").clicked() {
-                                    self.worker.request_refresh();
-                                }
-                                ui.add_sized(
-                                    [220.0, 20.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(concise_error(error, 96))
-                                            .color(egui::Color32::from_rgb(248, 113, 113)),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                        }
-                    });
-            });
+    fn start_drag(&mut self, ctx: &egui::Context) {
+        let current = Self::outer_position(ctx).or(self.compact_anchor);
+        self.position_tracker.start(current, self.now_ms());
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 }
 
@@ -544,51 +714,88 @@ impl eframe::App for FloatingApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
         self.place_once(ctx);
-        self.track_current_position(ctx);
         while let Ok(event) = self.worker.events.try_recv() {
             self.state.apply(event);
         }
-        if self.expanded && ctx.input(|input| input.viewport().focused == Some(false)) {
-            self.set_expanded(ctx, false);
+
+        let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let focus_lost = ctx.input(|input| input.viewport().focused == Some(false));
+        if should_collapse(self.morph.target_expanded(), escape, focus_lost) {
+            self.begin_transition(ctx, false);
         }
+
+        let frame = self.morph.frame(self.now_ms());
+        if let Some(placement) = self.placement {
+            let origin = origin_for_size(&placement, frame.size);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(frame.size));
+            if should_drive_viewport_position(self.morph.phase(), self.position_tracker.is_active())
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    origin.x as f32,
+                    origin.y as f32,
+                )));
+            }
+        }
+        self.track_current_position(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
-                let ball_offset = self
-                    .expanded_layout
-                    .map(|layout| layout.ball_offset)
-                    .unwrap_or(Position { x: 0, y: 0 });
-                let ball = egui::Rect::from_min_size(
-                    ui.min_rect().min + egui::vec2(ball_offset.x as f32, ball_offset.y as f32),
-                    BALL_SIZE,
+                let rect = egui::Rect::from_min_size(ui.min_rect().min, frame.size);
+                ui.painter().rect_filled(
+                    rect,
+                    frame.corner_radius,
+                    egui::Color32::from_rgb(30, 41, 59),
                 );
+                let interaction_rect = if self.morph.phase() == MorphPhase::Expanded {
+                    egui::Rect::from_min_size(
+                        rect.min + egui::vec2(12.0, 7.0),
+                        egui::vec2(202.0, 37.0),
+                    )
+                } else {
+                    rect
+                };
+                let sense = if frame.animating {
+                    egui::Sense::hover()
+                } else if self.morph.phase() == MorphPhase::Collapsed {
+                    egui::Sense::click_and_drag()
+                } else {
+                    egui::Sense::drag()
+                };
                 let response =
-                    ui.interact(ball, ui.id().with("ball"), egui::Sense::click_and_drag());
-                self.paint_ball(ui, ball);
-                if response.drag_started() {
-                    let current = self.compact_anchor;
-                    self.position_tracker
-                        .start(current, self.started_at.elapsed().as_millis() as u64);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    ui.interact(interaction_rect, ui.id().with("surface-interaction"), sense);
+                self.paint_compact(ui, rect, frame.compact_alpha);
+                if frame.content_alpha > 0.0 {
+                    self.paint_card_content(ui, rect, frame.content_alpha);
                 }
-                if response.clicked() {
-                    self.set_expanded(ctx, !self.expanded);
+                if !frame.animating && response.drag_started() {
+                    self.start_drag(ctx);
                 }
-                response.context_menu(|ui| {
-                    if ui.button("刷新").clicked() {
-                        self.worker.request_refresh();
-                        ui.close_menu();
-                    }
-                    if ui.button("退出").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
+                if self.morph.phase() == MorphPhase::Collapsed && response.clicked() {
+                    self.begin_transition(ctx, true);
+                }
+                if !frame.animating {
+                    response.context_menu(|ui| {
+                        if ui.button("刷新").clicked() {
+                            self.worker.request_refresh();
+                            ui.close_menu();
+                        }
+                        if ui.button("退出").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                }
             });
-        if self.expanded {
-            self.expanded_card(ctx);
+
+        if self.morph.phase() == MorphPhase::Collapsed && self.placement.is_some() {
+            self.placement = None;
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        if frame.animating {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 }

@@ -1,7 +1,5 @@
 use codex_quota_ball::{
-    config::ConfigStore,
-    fonts::load_cjk_font,
-    ui::{FloatingApp, BALL_SIZE},
+    config::ConfigStore, fonts::load_cjk_font, morph::COMPACT_SIZE, ui::FloatingApp,
     worker::spawn_worker,
 };
 use eframe::{egui, NativeOptions};
@@ -14,7 +12,7 @@ fn main() -> eframe::Result {
     let config_path = ConfigStore::default_path().expect("Linux config directory is unavailable");
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(BALL_SIZE)
+            .with_inner_size(COMPACT_SIZE)
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(false)
