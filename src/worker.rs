@@ -1,6 +1,7 @@
 use crate::{
     codex::{CodexClient, CommandSpec},
     quota::QuotaSnapshot,
+    usage::UsageSnapshot,
 };
 use std::{
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -16,7 +17,13 @@ enum WorkerCommand {
 #[derive(Debug)]
 pub enum WorkerEvent {
     Started,
-    Finished(Result<QuotaSnapshot, String>),
+    Finished(DashboardRead),
+}
+
+#[derive(Debug)]
+pub struct DashboardRead {
+    pub quota: Result<QuotaSnapshot, String>,
+    pub usage: Result<UsageSnapshot, String>,
 }
 
 pub struct WorkerHandle {
@@ -28,6 +35,62 @@ impl WorkerHandle {
     pub fn request_refresh(&self) {
         match self.commands.try_send(WorkerCommand::Refresh) {
             Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SectionState<T> {
+    pub value: Option<T>,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub updated_at: Option<SystemTime>,
+}
+
+impl<T> Default for SectionState<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            stale: false,
+            error: None,
+            updated_at: None,
+        }
+    }
+}
+
+impl<T> SectionState<T> {
+    fn finish(&mut self, result: Result<T, String>) {
+        match result {
+            Ok(value) => {
+                self.value = Some(value);
+                self.stale = false;
+                self.error = None;
+                self.updated_at = Some(SystemTime::now());
+            }
+            Err(error) => {
+                self.stale = self.value.is_some();
+                self.error = Some(error);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DashboardViewState {
+    pub quota: SectionState<QuotaSnapshot>,
+    pub usage: SectionState<UsageSnapshot>,
+    pub refreshing: bool,
+}
+
+impl DashboardViewState {
+    pub fn apply(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Started => self.refreshing = true,
+            WorkerEvent::Finished(read) => {
+                self.quota.finish(read.quota);
+                self.usage.finish(read.usage);
+                self.refreshing = false;
+            }
         }
     }
 }
@@ -45,18 +108,20 @@ impl QuotaViewState {
     pub fn apply(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Started => self.refreshing = true,
-            WorkerEvent::Finished(Ok(snapshot)) => {
-                self.snapshot = Some(snapshot);
-                self.refreshing = false;
-                self.stale = false;
-                self.error = None;
-                self.updated_at = Some(SystemTime::now());
-            }
-            WorkerEvent::Finished(Err(error)) => {
-                self.refreshing = false;
-                self.stale = self.snapshot.is_some();
-                self.error = Some(error);
-            }
+            WorkerEvent::Finished(read) => match read.quota {
+                Ok(snapshot) => {
+                    self.snapshot = Some(snapshot);
+                    self.refreshing = false;
+                    self.stale = false;
+                    self.error = None;
+                    self.updated_at = Some(SystemTime::now());
+                }
+                Err(error) => {
+                    self.refreshing = false;
+                    self.stale = self.snapshot.is_some();
+                    self.error = Some(error);
+                }
+            },
         }
     }
 }
@@ -78,21 +143,41 @@ pub fn spawn_worker_with(spec: CommandSpec, timeout: Duration, interval: Duratio
             if event_tx.send(WorkerEvent::Started).is_err() {
                 break;
             }
-            let result = (|| {
-                if client.is_none() {
-                    client = Some(CodexClient::connect(spec.clone(), timeout)?);
+            let connect_error = if client.is_none() {
+                match CodexClient::connect(spec.clone(), timeout) {
+                    Ok(connected) => {
+                        client = Some(connected);
+                        None
+                    }
+                    Err(error) => Some(error.to_string()),
                 }
-                client.as_mut().unwrap().read_quota()
-            })();
-            if result.is_err() {
+            } else {
+                None
+            };
+
+            let read = match connect_error {
+                Some(message) => DashboardRead {
+                    quota: Err(message.clone()),
+                    usage: Err(message),
+                },
+                None => {
+                    let active = client
+                        .as_mut()
+                        .expect("client exists after successful connect");
+                    DashboardRead {
+                        quota: active.read_quota().map_err(|error| error.to_string()),
+                        usage: active.read_usage().map_err(|error| error.to_string()),
+                    }
+                }
+            };
+            if client
+                .as_ref()
+                .map(CodexClient::is_terminal)
+                .unwrap_or(false)
+            {
                 client = None;
             }
-            if event_tx
-                .send(WorkerEvent::Finished(
-                    result.map_err(|error| error.to_string()),
-                ))
-                .is_err()
-            {
+            if event_tx.send(WorkerEvent::Finished(read)).is_err() {
                 break;
             }
             match command_rx.recv_timeout(interval) {
