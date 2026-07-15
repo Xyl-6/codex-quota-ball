@@ -17,9 +17,20 @@ install -Dm755 "$binary" "$destination"
 install -Dm644 "$root/assets/codex-quota-ball.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/codex-quota-ball.svg"
 install -d "$HOME/.local/share/applications" "$HOME/.config/autostart"
 
-replacement="${destination//\\/\\\\}"
-replacement="${replacement//&/\\&}"
-replacement="${replacement//|/\\|}"
-sed "s|@EXEC@|$replacement|g" "$root/packaging/codex-quota-ball.desktop.in" > "$HOME/.local/share/applications/codex-quota-ball.desktop"
-sed "s|@EXEC@|$replacement|g" "$root/packaging/codex-quota-ball-autostart.desktop.in" > "$HOME/.config/autostart/codex-quota-ball.desktop"
+exec_value="${destination//\\/\\\\\\\\}"
+exec_value="${exec_value//\"/\\\"}"
+render_desktop_file() {
+  local template="$1"
+  local output="$2"
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == 'Exec="@EXEC@"' ]]; then
+      printf 'Exec="%s"\n' "$exec_value"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$template" > "$output"
+}
+render_desktop_file "$root/packaging/codex-quota-ball.desktop.in" "$HOME/.local/share/applications/codex-quota-ball.desktop"
+render_desktop_file "$root/packaging/codex-quota-ball-autostart.desktop.in" "$HOME/.config/autostart/codex-quota-ball.desktop"
 printf 'Installed Codex Quota Ball for the current user.\n'

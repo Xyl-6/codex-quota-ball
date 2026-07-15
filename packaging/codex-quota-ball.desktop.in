@@ -2,7 +2,7 @@
 Type=Application
 Name=Codex Quota Ball
 Comment=Show remaining Codex quota
-Exec=@EXEC@
+Exec="@EXEC@"
 Icon=codex-quota-ball
 Terminal=false
 Categories=Utility;Development;
