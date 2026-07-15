@@ -131,6 +131,13 @@ fn grows_up(growth: Growth) -> bool {
     matches!(growth, Growth::RightUp | Growth::LeftUp)
 }
 
+fn contains(bounds: Bounds, point: Position) -> bool {
+    point.x >= bounds.x
+        && point.y >= bounds.y
+        && point.x < bounds.x.saturating_add(bounds.width)
+        && point.y < bounds.y.saturating_add(bounds.height)
+}
+
 fn raw_anchor_from_expanded(origin: Position, growth: Growth) -> Position {
     Position {
         x: if grows_left(growth) {
@@ -241,8 +248,17 @@ pub fn reflow_expanded_drag(
     primary_monitor: usize,
 ) -> Option<MorphPlacement> {
     let raw_anchor = raw_anchor_from_expanded(expanded_origin, growth);
-    let workarea = select_bounds(workareas, primary_monitor, raw_anchor)
-        .or_else(|| select_bounds(workareas, primary_monitor, expanded_origin))?;
+    let workarea = workareas
+        .iter()
+        .copied()
+        .find(|bounds| contains(*bounds, raw_anchor))
+        .or_else(|| {
+            workareas
+                .iter()
+                .copied()
+                .find(|bounds| contains(*bounds, expanded_origin))
+        })
+        .or_else(|| select_bounds(workareas, primary_monitor, raw_anchor))?;
     let expanded_origin = clamp_to_known_bounds(
         expanded_origin,
         Some(workarea),

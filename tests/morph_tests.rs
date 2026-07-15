@@ -2,7 +2,7 @@ use codex_quota_ball::{
     config::Position,
     morph::{
         compact_anchor_from_expanded, morph_placement, origin_for_size, reflow_expanded_drag,
-        Growth, MorphAnimation, COLLAPSE_MS, COMPACT_SIZE, EXPANDED_SIZE, EXPAND_MS,
+        Growth, MorphAnimation, MorphPhase, COLLAPSE_MS, COMPACT_SIZE, EXPANDED_SIZE, EXPAND_MS,
     },
     x11::Bounds,
 };
@@ -47,9 +47,33 @@ fn animation_reverses_without_jumping_and_finishes_within_collapse_duration() {
     assert_eq!(after_reversal.size, before_reversal.size);
     assert_eq!(after_reversal.corner_radius, before_reversal.corner_radius);
 
-    let collapsed = animation.frame(midpoint + COLLAPSE_MS);
+    let before_deadline = animation.frame(midpoint + 157);
+    assert!(before_deadline.animating);
+
+    let collapsed = animation.frame(midpoint + 158);
     assert_eq!(collapsed.size, COMPACT_SIZE);
     assert!(!collapsed.animating);
+}
+
+#[test]
+fn animation_uses_exact_easing_curves_and_reports_all_phases() {
+    let mut animation = MorphAnimation::default();
+    assert_eq!(animation.phase(), MorphPhase::Collapsed);
+
+    animation.set_expanded(true, 1000);
+    assert_eq!(animation.phase(), MorphPhase::Expanding);
+    let expanding = animation.frame(1000 + EXPAND_MS / 4);
+    assert!((expanding.progress - 0.578_125).abs() < 0.000_001);
+
+    animation.frame(1000 + EXPAND_MS);
+    assert_eq!(animation.phase(), MorphPhase::Expanded);
+    animation.set_expanded(false, 2000);
+    assert_eq!(animation.phase(), MorphPhase::Collapsing);
+    let collapsing = animation.frame(2000 + COLLAPSE_MS / 4);
+    assert!((collapsing.progress - 0.984_375).abs() < 0.000_001);
+
+    animation.frame(2000 + COLLAPSE_MS);
+    assert_eq!(animation.phase(), MorphPhase::Collapsed);
 }
 
 #[test]
@@ -98,4 +122,29 @@ fn expanded_drag_crosses_monitors_and_preserves_growth_direction() {
     assert_eq!(moved.compact_anchor, Position { x: 1832, y: 904 });
     assert!(moved.expanded_origin.x + EXPANDED_SIZE.x as i32 <= 1920);
     assert!(moved.expanded_origin.y + EXPANDED_SIZE.y as i32 <= 1080);
+}
+
+#[test]
+fn expanded_drag_prefers_monitor_containing_origin_before_primary_fallback() {
+    let areas = [
+        Bounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+        Bounds {
+            x: 3000,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+    ];
+
+    let moved =
+        reflow_expanded_drag(Position { x: 4800, y: 100 }, Growth::LeftDown, &areas, 0).unwrap();
+
+    assert_eq!(moved.expanded_origin, Position { x: 4630, y: 100 });
+    assert_eq!(moved.compact_anchor, Position { x: 4832, y: 100 });
+    assert_eq!(moved.growth, Growth::LeftDown);
 }
