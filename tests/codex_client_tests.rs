@@ -40,10 +40,14 @@ fn rejects_malformed_output_without_panicking() {
 }
 
 #[test]
-fn times_out_and_reaps_the_blocking_process() {
+fn timeout_makes_client_terminal_and_reaps_the_blocking_process() {
     let (_guard, command) = fake("timeout");
     let mut client = CodexClient::connect(command, Duration::from_millis(50)).unwrap();
     assert!(matches!(client.read_quota(), Err(ClientError::Timeout)));
+
+    let reuse_started = Instant::now();
+    assert!(matches!(client.read_quota(), Err(ClientError::Timeout)));
+    assert!(reuse_started.elapsed() < Duration::from_millis(25));
     drop(client);
 }
 
@@ -60,6 +64,19 @@ fn reports_child_exit_status_when_stdout_closes() {
 #[test]
 fn bounds_version_probe_and_reports_unknown_version() {
     let (_guard, command) = fake("version-hang");
+    let started = Instant::now();
+    let mut client = CodexClient::connect(command, Duration::from_millis(50)).unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(
+        client.read_quota(),
+        Err(ClientError::Protocol(message)) if message.contains("unknown version")
+    ));
+}
+
+#[test]
+fn bounds_version_probe_when_descendant_holds_stdout() {
+    let (_guard, command) = fake("version-descendant");
     let started = Instant::now();
     let mut client = CodexClient::connect(command, Duration::from_millis(50)).unwrap();
 

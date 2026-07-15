@@ -5,6 +5,9 @@ if [[ "${1:-}" == "--version" ]]; then
   if [[ "$scenario" == "version-hang" ]]; then
     exec sleep 2
   fi
+  if [[ "$scenario" == "version-descendant" ]]; then
+    sleep 2 &
+  fi
   printf '%s\n' 'fake-codex 1.2.3'
   exit 0
 fi
@@ -21,7 +24,7 @@ while IFS= read -r line; do
       malformed) printf '%s\n' '{broken-json' ;;
       timeout) exec sleep 2 ;;
       exit) exit 7 ;;
-      version-hang) printf '%s\n' '{"id":2,"result":{}}' ;;
+      version-hang|version-descendant) printf '%s\n' '{"id":2,"result":{}}' ;;
     esac
   fi
 done

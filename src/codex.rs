@@ -4,8 +4,8 @@ use std::{
     fmt,
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
 };
@@ -37,7 +37,7 @@ impl CommandSpec {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientError {
     MissingCodex,
     NotLoggedIn,
@@ -64,11 +64,17 @@ impl std::error::Error for ClientError {}
 
 pub struct CodexClient {
     child: Child,
-    stdin: ChildStdin,
+    writer: Sender<WriteRequest>,
     messages: Receiver<Result<Value, String>>,
     timeout: Duration,
     next_id: u64,
     version: String,
+    terminal: Option<ClientError>,
+}
+
+struct WriteRequest {
+    bytes: Vec<u8>,
+    ack: Sender<Result<(), String>>,
 }
 
 impl CodexClient {
@@ -87,14 +93,22 @@ impl CodexClient {
                     ClientError::Process(error.to_string())
                 }
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ClientError::Process("stdin unavailable".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ClientError::Process("stdout unavailable".into()))?;
+        let mut stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::Process("stdin unavailable".into()));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::Process("stdout unavailable".into()));
+            }
+        };
         let (sender, messages) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -106,13 +120,28 @@ impl CodexClient {
                 }
             }
         });
+        let (writer, writes) = mpsc::channel::<WriteRequest>();
+        thread::spawn(move || {
+            for request in writes {
+                let result = stdin
+                    .write_all(&request.bytes)
+                    .and_then(|_| stdin.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = request.ack.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
         let mut client = Self {
             child,
-            stdin,
+            writer,
             messages,
             timeout,
             next_id: 1,
             version,
+            terminal: None,
         };
         let initialize = json!({
             "id": 1,
@@ -126,50 +155,84 @@ impl CodexClient {
                 "capabilities": {"experimentalApi": true}
             }
         });
-        client.send(&initialize)?;
-        client.recv_for_id(1)?;
-        client.send(&json!({"method": "initialized"}))?;
+        let deadline = client.deadline()?;
+        client.send(&initialize, deadline)?;
+        client.recv_for_id(1, deadline)?;
+        let deadline = client.deadline()?;
+        client.send(&json!({"method": "initialized"}), deadline)?;
         client.next_id = 2;
         Ok(client)
     }
 
     pub fn read_quota(&mut self) -> Result<QuotaSnapshot, ClientError> {
+        if let Some(error) = &self.terminal {
+            return Err(error.clone());
+        }
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({"id": id, "method": "account/rateLimits/read"}))?;
-        let response = self.recv_for_id(id)?;
-        parse_quota_response(&response)
-            .map_err(|error| ClientError::Protocol(format!("{} ({})", error, self.version)))
+        let deadline = self.deadline()?;
+        self.send(
+            &json!({"id": id, "method": "account/rateLimits/read"}),
+            deadline,
+        )?;
+        let response = self.recv_for_id(id, deadline)?;
+        match parse_quota_response(&response) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => self.fail(ClientError::Protocol(format!(
+                "{} ({})",
+                error, self.version
+            ))),
+        }
     }
 
-    fn send(&mut self, message: &Value) -> Result<(), ClientError> {
-        serde_json::to_writer(&mut self.stdin, message)
-            .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        self.stdin
-            .write_all(b"\n")
-            .and_then(|_| self.stdin.flush())
-            .map_err(|error| ClientError::Process(error.to_string()))
+    fn deadline(&mut self) -> Result<Instant, ClientError> {
+        match Instant::now().checked_add(self.timeout) {
+            Some(deadline) => Ok(deadline),
+            None => self.fail(ClientError::Timeout),
+        }
     }
 
-    fn recv_for_id(&mut self, id: u64) -> Result<Value, ClientError> {
-        let deadline = Instant::now()
-            .checked_add(self.timeout)
-            .ok_or(ClientError::Timeout)?;
+    fn send(&mut self, message: &Value, deadline: Instant) -> Result<(), ClientError> {
+        let mut bytes = match serde_json::to_vec(message) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fail(ClientError::Protocol(error.to_string())),
+        };
+        bytes.push(b'\n');
+        let (ack, written) = mpsc::channel();
+        if self.writer.send(WriteRequest { bytes, ack }).is_err() {
+            return self.fail(ClientError::Process("stdin writer closed".into()));
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return self.fail(ClientError::Timeout);
+        }
+        match written.recv_timeout(wait) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => self.fail(ClientError::Process(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => self.fail(ClientError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.fail(ClientError::Process("stdin writer closed".into()))
+            }
+        }
+    }
+
+    fn recv_for_id(&mut self, id: u64, deadline: Instant) -> Result<Value, ClientError> {
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
             if wait.is_zero() {
-                return Err(ClientError::Timeout);
+                return self.fail(ClientError::Timeout);
             }
             let value = match self.messages.recv_timeout(wait) {
-                Ok(value) => value.map_err(ClientError::Protocol)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => return Err(ClientError::Timeout),
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => return self.fail(ClientError::Protocol(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => return self.fail(ClientError::Timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     let message = match self.child.try_wait() {
                         Ok(Some(status)) => format!("stdout closed ({status})"),
                         Ok(None) => "stdout closed".to_owned(),
                         Err(error) => format!("stdout closed ({error})"),
                     };
-                    return Err(ClientError::Process(message));
+                    return self.fail(ClientError::Process(message));
                 }
             };
             if value.get("id").and_then(Value::as_u64) != Some(id) {
@@ -192,6 +255,11 @@ impl CodexClient {
             return Ok(value);
         }
     }
+
+    fn fail<T>(&mut self, error: ClientError) -> Result<T, ClientError> {
+        self.terminal.get_or_insert_with(|| error.clone());
+        Err(error)
+    }
 }
 
 fn probe_version(program: &PathBuf, timeout: Duration) -> String {
@@ -204,6 +272,20 @@ fn probe_version(program: &PathBuf, timeout: Duration) -> String {
         Ok(child) => child,
         Err(_) => return "unknown version".to_owned(),
     };
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return "unknown version".to_owned();
+        }
+    };
+    let (output_sender, output) = mpsc::channel();
+    thread::spawn(move || {
+        let mut version = String::new();
+        let result = stdout.read_to_string(&mut version).map(|_| version);
+        let _ = output_sender.send(result);
+    });
     let deadline = match Instant::now().checked_add(timeout) {
         Some(deadline) => deadline,
         None => {
@@ -218,17 +300,14 @@ fn probe_version(program: &PathBuf, timeout: Duration) -> String {
                 if !status.success() {
                     return "unknown version".to_owned();
                 }
-                let mut version = String::new();
-                if child
-                    .stdout
-                    .take()
-                    .and_then(|mut stdout| stdout.read_to_string(&mut version).ok())
-                    .is_some()
-                {
-                    let version = version.trim();
-                    if !version.is_empty() {
-                        return version.to_owned();
-                    }
+                let wait = deadline.saturating_duration_since(Instant::now());
+                let version = match output.recv_timeout(wait) {
+                    Ok(Ok(version)) => version,
+                    Ok(Err(_)) | Err(_) => return "unknown version".to_owned(),
+                };
+                let version = version.trim();
+                if !version.is_empty() {
+                    return version.to_owned();
                 }
                 return "unknown version".to_owned();
             }
