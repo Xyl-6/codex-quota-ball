@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Quota Ball
+Exec=@EXEC@
+Icon=codex-quota-ball
+Terminal=false
+X-GNOME-Autostart-enabled=true

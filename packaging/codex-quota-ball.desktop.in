@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Quota Ball
+Comment=Show remaining Codex quota
+Exec=@EXEC@
+Icon=codex-quota-ball
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=false
