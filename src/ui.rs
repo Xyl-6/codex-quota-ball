@@ -1,13 +1,16 @@
 use crate::{
     config::{ConfigStore, Position},
     morph::{
-        morph_placement, origin_for_size, reflow_expanded_drag, MorphAnimation, MorphPhase,
+        morph_placement, origin_for_size, reflow_expanded_drag, Growth, MorphAnimation, MorphPhase,
         MorphPlacement, COMPACT_SIZE,
     },
     quota::{format_reset_time, ring_tone, weekly_window, QuotaWindow, RingTone},
     usage::{format_tokens, heatmap_cells, month_labels, HeatCell},
     worker::{DashboardViewState, SectionState, WorkerHandle},
-    x11::{clamp_to_known_bounds, query_monitor_bounds, select_bounds, Bounds},
+    x11::{
+        clamp_to_known_bounds, query_monitor_bounds, rounded_input_rectangles, select_bounds,
+        Bounds, InputShaper,
+    },
 };
 use chrono::Local;
 use eframe::egui;
@@ -36,6 +39,65 @@ pub fn should_collapse(target_expanded: bool, escape: bool, focus_lost: bool) ->
 
 pub fn should_drive_viewport_position(phase: MorphPhase, drag_active: bool) -> bool {
     phase != MorphPhase::Expanded || !drag_active
+}
+
+pub fn point_in_rounded_rect(rect: egui::Rect, radius: f32, point: egui::Pos2) -> bool {
+    if !rect.contains(point) {
+        return false;
+    }
+    let radius = radius.clamp(0.0, rect.width().min(rect.height()) / 2.0);
+    if radius == 0.0 {
+        return true;
+    }
+    let center = egui::pos2(
+        point.x.clamp(rect.left() + radius, rect.right() - radius),
+        point.y.clamp(rect.top() + radius, rect.bottom() - radius),
+    );
+    center.distance_sq(point) <= radius * radius
+}
+
+pub fn background_drag_allowed(
+    surface: egui::Rect,
+    radius: f32,
+    point: egui::Pos2,
+    blockers: &[egui::Rect],
+) -> bool {
+    point_in_rounded_rect(surface, radius, point)
+        && !blockers.iter().any(|rect| rect.contains(point))
+}
+
+pub fn rounded_surface_rects(surface: egui::Rect, radius: f32) -> Vec<egui::Rect> {
+    rounded_input_rectangles(surface.width(), surface.height(), radius, 1.0)
+        .into_iter()
+        .map(|rect| {
+            egui::Rect::from_min_size(
+                surface.min + egui::vec2(f32::from(rect.x), f32::from(rect.y)),
+                egui::vec2(f32::from(rect.width), f32::from(rect.height)),
+            )
+        })
+        .collect()
+}
+
+pub fn compact_face_geometry(
+    surface: egui::Rect,
+    growth: Growth,
+    compact_alpha: f32,
+) -> (egui::Pos2, f32) {
+    let left = matches!(growth, Growth::LeftDown | Growth::LeftUp);
+    let up = matches!(growth, Growth::RightUp | Growth::LeftUp);
+    let center = egui::pos2(
+        if left {
+            surface.right() - COMPACT_SIZE.x / 2.0
+        } else {
+            surface.left() + COMPACT_SIZE.x / 2.0
+        },
+        if up {
+            surface.bottom() - COMPACT_SIZE.y / 2.0
+        } else {
+            surface.top() + COMPACT_SIZE.y / 2.0
+        },
+    );
+    (center, 38.0 * compact_alpha.clamp(0.0, 1.0))
 }
 
 pub fn heat_tooltip(cell: &HeatCell) -> String {
@@ -154,6 +216,8 @@ pub struct FloatingApp {
     primary_monitor: usize,
     position_tracker: PositionSettleTracker,
     started_at: Instant,
+    input_shaper: Option<InputShaper>,
+    input_shape_attempted: bool,
 }
 
 impl FloatingApp {
@@ -172,6 +236,8 @@ impl FloatingApp {
             primary_monitor,
             position_tracker: PositionSettleTracker::default(),
             started_at: Instant::now(),
+            input_shaper: None,
+            input_shape_attempted: false,
         }
     }
 
@@ -333,7 +399,7 @@ impl FloatingApp {
         }
     }
 
-    fn paint_compact(&self, ui: &egui::Ui, rect: egui::Rect, alpha: f32) {
+    fn paint_compact(&self, ui: &egui::Ui, rect: egui::Rect, growth: Growth, alpha: f32) {
         let remaining = self
             .state
             .quota
@@ -347,17 +413,24 @@ impl FloatingApp {
             RingTone::Red => egui::Color32::from_rgb(239, 68, 68),
             RingTone::Gray => egui::Color32::from_rgb(100, 116, 139),
         };
-        let center = rect.center();
+        let (center, radius) = compact_face_geometry(rect, growth, alpha);
+        if radius <= 0.0 {
+            return;
+        }
+        let scale = radius / 38.0;
         ui.painter().circle_stroke(
             center,
-            38.0,
-            egui::Stroke::new(7.0, faded(egui::Color32::from_rgb(51, 65, 85), alpha)),
+            radius,
+            egui::Stroke::new(
+                7.0 * scale,
+                faded(egui::Color32::from_rgb(51, 65, 85), alpha),
+            ),
         );
-        let points = ring_points(center, 38.0, remaining.unwrap_or(0));
+        let points = ring_points(center, radius, remaining.unwrap_or(0));
         if points.len() > 1 {
             ui.painter().add(egui::Shape::line(
                 points,
-                egui::Stroke::new(7.0, faded(color, alpha)),
+                egui::Stroke::new(7.0 * scale, faded(color, alpha)),
             ));
         }
         let label = remaining
@@ -367,7 +440,7 @@ impl FloatingApp {
             center,
             egui::Align2::CENTER_CENTER,
             label,
-            egui::FontId::proportional(19.0),
+            egui::FontId::proportional(19.0 * scale),
             faded(egui::Color32::WHITE, alpha),
         );
     }
@@ -632,8 +705,7 @@ impl FloatingApp {
             egui::Color32::WHITE,
             alpha,
         );
-        let refresh_rect =
-            egui::Rect::from_min_size(origin + egui::vec2(202.0, -1.0), egui::vec2(52.0, 22.0));
+        let refresh_rect = Self::refresh_rect(rect);
         if Self::paint_button(
             ui,
             refresh_rect,
@@ -691,10 +763,7 @@ impl FloatingApp {
             error_y += 13.0;
         }
         if self.state.quota.error.is_some() || self.state.usage.error.is_some() {
-            let retry = egui::Rect::from_min_size(
-                egui::pos2(origin.x + 218.0, origin.y + 229.0),
-                egui::vec2(36.0, 20.0),
-            );
+            let retry = Self::retry_rect(rect);
             if Self::paint_button(ui, retry, "retry", "重试", interactive, alpha).clicked() {
                 self.worker.request_refresh();
             }
@@ -706,6 +775,44 @@ impl FloatingApp {
         self.position_tracker.start(current, self.now_ms());
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
+
+    fn refresh_rect(surface: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(
+            surface.min + egui::vec2(220.0, 12.0),
+            egui::vec2(52.0, 22.0),
+        )
+    }
+
+    fn retry_rect(surface: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(
+            surface.min + egui::vec2(236.0, 242.0),
+            egui::vec2(36.0, 20.0),
+        )
+    }
+
+    fn interaction_blockers(&self, surface: egui::Rect) -> Vec<egui::Rect> {
+        let mut blockers = vec![Self::refresh_rect(surface)];
+        if self.state.quota.error.is_some() || self.state.usage.error.is_some() {
+            blockers.push(Self::retry_rect(surface));
+        }
+        if let Some(daily) = self
+            .state
+            .usage
+            .value
+            .as_ref()
+            .and_then(|snapshot| snapshot.daily.as_ref())
+        {
+            let grid = surface.min + egui::vec2(40.0, 152.0);
+            blockers.extend(
+                heatmap_cells(Local::now().date_naive(), daily)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| !cell.future)
+                    .map(|(index, _)| heat_cell_rect(grid, index)),
+            );
+        }
+        blockers
+    }
 }
 
 impl eframe::App for FloatingApp {
@@ -713,7 +820,7 @@ impl eframe::App for FloatingApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, native_frame: &mut eframe::Frame) {
         ctx.set_visuals(egui::Visuals::dark());
         self.place_once(ctx);
         while let Ok(event) = self.worker.events.try_recv() {
@@ -727,6 +834,30 @@ impl eframe::App for FloatingApp {
         }
 
         let frame = self.morph.frame(self.now_ms());
+        if !self.input_shape_attempted {
+            self.input_shape_attempted = true;
+            self.input_shaper = InputShaper::from_frame(native_frame);
+        }
+        let pixels_per_point = ctx.input(|input| {
+            input
+                .viewport()
+                .native_pixels_per_point
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .unwrap_or(1.0)
+        });
+        let input_shape_failed = self.input_shaper.as_mut().is_some_and(|shaper| {
+            shaper
+                .update(
+                    frame.size.x,
+                    frame.size.y,
+                    frame.corner_radius,
+                    pixels_per_point,
+                )
+                .is_err()
+        });
+        if input_shape_failed {
+            self.input_shaper = None;
+        }
         if let Some(placement) = self.placement {
             let origin = origin_for_size(&placement, frame.size);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(frame.size));
@@ -749,43 +880,57 @@ impl eframe::App for FloatingApp {
                     frame.corner_radius,
                     egui::Color32::from_rgb(30, 41, 59),
                 );
-                let interaction_rect = if self.morph.phase() == MorphPhase::Expanded {
-                    egui::Rect::from_min_size(
-                        rect.min + egui::vec2(12.0, 7.0),
-                        egui::vec2(202.0, 37.0),
-                    )
+                let blockers = if self.morph.phase() == MorphPhase::Expanded {
+                    self.interaction_blockers(rect)
                 } else {
-                    rect
+                    Vec::new()
                 };
                 let sense = if frame.animating {
                     egui::Sense::hover()
-                } else if self.morph.phase() == MorphPhase::Collapsed {
-                    egui::Sense::click_and_drag()
                 } else {
-                    egui::Sense::drag()
+                    egui::Sense::click_and_drag()
                 };
-                let response =
-                    ui.interact(interaction_rect, ui.id().with("surface-interaction"), sense);
-                self.paint_compact(ui, rect, frame.compact_alpha);
+                let responses: Vec<_> = rounded_surface_rects(rect, frame.corner_radius)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, strip)| {
+                        ui.interact(strip, ui.id().with(("surface-interaction", index)), sense)
+                    })
+                    .collect();
+                let growth = self
+                    .placement
+                    .map(|placement| placement.growth)
+                    .unwrap_or(Growth::RightDown);
+                self.paint_compact(ui, rect, growth, frame.compact_alpha);
                 if frame.content_alpha > 0.0 {
                     self.paint_card_content(ui, rect, frame.content_alpha);
                 }
-                if !frame.animating && response.drag_started() {
+                let pointer = ctx.input(|input| input.pointer.interact_pos());
+                let background_allowed = !frame.animating
+                    && pointer.is_some_and(|point| {
+                        background_drag_allowed(rect, frame.corner_radius, point, &blockers)
+                    });
+                if background_allowed && responses.iter().any(egui::Response::drag_started) {
                     self.start_drag(ctx);
                 }
-                if self.morph.phase() == MorphPhase::Collapsed && response.clicked() {
+                if background_allowed
+                    && self.morph.phase() == MorphPhase::Collapsed
+                    && responses.iter().any(egui::Response::clicked)
+                {
                     self.begin_transition(ctx, true);
                 }
-                if !frame.animating {
-                    response.context_menu(|ui| {
-                        if ui.button("刷新").clicked() {
-                            self.worker.request_refresh();
-                            ui.close_menu();
-                        }
-                        if ui.button("退出").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
+                if background_allowed {
+                    for response in responses {
+                        response.context_menu(|ui| {
+                            if ui.button("刷新").clicked() {
+                                self.worker.request_refresh();
+                                ui.close_menu();
+                            }
+                            if ui.button("退出").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    }
                 }
             });
 

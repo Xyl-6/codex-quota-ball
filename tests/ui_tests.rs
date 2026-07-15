@@ -1,9 +1,10 @@
 use chrono::NaiveDate;
 use codex_quota_ball::{
     config::Position,
-    morph::MorphPhase,
+    morph::{Growth, MorphPhase},
     ui::{
-        concise_error, heat_cell_rect, heat_tooltip, ring_points, should_collapse,
+        background_drag_allowed, compact_face_geometry, concise_error, heat_cell_rect,
+        heat_tooltip, point_in_rounded_rect, ring_points, rounded_surface_rects, should_collapse,
         should_drive_viewport_position, PositionSettleTracker,
     },
     usage::HeatCell,
@@ -37,6 +38,70 @@ fn expanded_drag_temporarily_owns_viewport_position() {
     assert!(should_drive_viewport_position(MorphPhase::Expanded, false));
     assert!(should_drive_viewport_position(MorphPhase::Expanding, true));
     assert!(should_drive_viewport_position(MorphPhase::Collapsing, true));
+}
+
+#[test]
+fn rounded_surface_rejects_transparent_corners_and_control_regions() {
+    let surface = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(290.0, 292.0));
+    let refresh = egui::Rect::from_min_size(egui::pos2(220.0, 12.0), egui::vec2(52.0, 22.0));
+    let heat_cell = egui::Rect::from_min_size(egui::pos2(40.0, 152.0), egui::vec2(7.0, 7.0));
+    let blockers = [refresh, heat_cell];
+
+    assert!(!point_in_rounded_rect(surface, 18.0, egui::pos2(0.0, 0.0)));
+    assert!(point_in_rounded_rect(
+        surface,
+        18.0,
+        egui::pos2(280.0, 146.0)
+    ));
+    assert!(background_drag_allowed(
+        surface,
+        18.0,
+        egui::pos2(280.0, 146.0),
+        &blockers
+    ));
+    assert!(!background_drag_allowed(
+        surface,
+        18.0,
+        refresh.center(),
+        &blockers
+    ));
+    assert!(!background_drag_allowed(
+        surface,
+        18.0,
+        heat_cell.center(),
+        &blockers
+    ));
+}
+
+#[test]
+fn rounded_surface_interaction_strips_do_not_cover_transparent_corners() {
+    let surface = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(88.0, 88.0));
+    let strips = rounded_surface_rects(surface, 44.0);
+    assert!(!strips.is_empty());
+    assert!(strips.len() < 88);
+    assert!(!strips.iter().any(|rect| rect.contains(surface.min)));
+    assert!(strips.iter().any(|rect| rect.contains(surface.center())));
+}
+
+#[test]
+fn compact_face_stays_in_the_growth_anchor_corner_and_scales_down() {
+    let surface = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(189.0, 190.0));
+    assert_eq!(
+        compact_face_geometry(surface, Growth::RightDown, 1.0),
+        (egui::pos2(54.0, 64.0), 38.0)
+    );
+    assert_eq!(
+        compact_face_geometry(surface, Growth::RightUp, 1.0),
+        (egui::pos2(54.0, 166.0), 38.0)
+    );
+    assert_eq!(
+        compact_face_geometry(surface, Growth::LeftDown, 1.0),
+        (egui::pos2(155.0, 64.0), 38.0)
+    );
+    assert_eq!(
+        compact_face_geometry(surface, Growth::LeftUp, 0.5),
+        (egui::pos2(155.0, 166.0), 19.0)
+    );
 }
 
 #[test]

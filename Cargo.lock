@@ -639,6 +639,7 @@ dependencies = [
  "chrono",
  "dirs",
  "eframe",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "x11rb",

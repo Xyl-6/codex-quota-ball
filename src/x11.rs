@@ -1,7 +1,145 @@
 use crate::config::Position;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
+use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Rectangle, Window};
+use x11rb::rust_connection::RustConnection;
+
+pub fn rounded_input_rectangles(
+    logical_width: f32,
+    logical_height: f32,
+    logical_radius: f32,
+    pixels_per_point: f32,
+) -> Vec<Rectangle> {
+    let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let physical = |value: f32| {
+        (value.max(0.0) * scale)
+            .round()
+            .clamp(1.0, f32::from(i16::MAX)) as i32
+    };
+    let width = physical(logical_width);
+    let height = physical(logical_height);
+    let radius = physical(logical_radius).min(width.min(height) / 2);
+
+    let mut rectangles: Vec<Rectangle> = Vec::new();
+    for y in 0..height {
+        let edge_distance = if y < radius {
+            radius as f32 - (y as f32 + 0.5)
+        } else if y >= height - radius {
+            y as f32 + 0.5 - (height - radius) as f32
+        } else {
+            0.0
+        };
+        let inset = if edge_distance > 0.0 {
+            let half_width = ((radius * radius) as f32 - edge_distance * edge_distance)
+                .max(0.0)
+                .sqrt();
+            (radius as f32 - half_width - 0.5).ceil().max(0.0) as i32
+        } else {
+            0
+        };
+        let row_width = width.saturating_sub(inset.saturating_mul(2));
+        if row_width <= 0 {
+            continue;
+        }
+        if let Some(previous) = rectangles.last_mut() {
+            if i32::from(previous.x) == inset
+                && i32::from(previous.width) == row_width
+                && i32::from(previous.y) + i32::from(previous.height) == y
+                && previous.height < u16::MAX
+            {
+                previous.height += 1;
+                continue;
+            }
+        }
+        rectangles.push(Rectangle {
+            x: inset as i16,
+            y: y as i16,
+            width: row_width as u16,
+            height: 1,
+        });
+    }
+    rectangles
+}
+
+fn same_rectangles(left: &[Rectangle], right: &[Rectangle]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.x == right.x
+                && left.y == right.y
+                && left.width == right.width
+                && left.height == right.height
+        })
+}
+
+pub struct InputShaper {
+    connection: RustConnection,
+    window: Window,
+    last_rectangles: Vec<Rectangle>,
+}
+
+#[derive(Debug)]
+pub struct InputShapeError;
+
+impl InputShaper {
+    pub fn from_frame(frame: &eframe::Frame) -> Option<Self> {
+        let raw = frame.window_handle().ok()?.as_raw();
+        let window = match raw {
+            RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok()?,
+            RawWindowHandle::Xcb(handle) => handle.window.get(),
+            _ => return None,
+        };
+        let (connection, _) = x11rb::connect(None).ok()?;
+        let version = connection.shape_query_version().ok()?.reply().ok()?;
+        if version.major_version < 1 || (version.major_version == 1 && version.minor_version < 1) {
+            return None;
+        }
+        Some(Self {
+            connection,
+            window,
+            last_rectangles: Vec::new(),
+        })
+    }
+
+    pub fn update(
+        &mut self,
+        logical_width: f32,
+        logical_height: f32,
+        logical_radius: f32,
+        pixels_per_point: f32,
+    ) -> Result<(), InputShapeError> {
+        let rectangles = rounded_input_rectangles(
+            logical_width,
+            logical_height,
+            logical_radius,
+            pixels_per_point,
+        );
+        if same_rectangles(&self.last_rectangles, &rectangles) {
+            return Ok(());
+        }
+        self.connection
+            .shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                x11rb::protocol::xproto::ClipOrdering::YX_BANDED,
+                self.window,
+                0,
+                0,
+                &rectangles,
+            )
+            .map_err(|_| InputShapeError)?
+            .check()
+            .map_err(|_| InputShapeError)?;
+        self.connection.flush().map_err(|_| InputShapeError)?;
+        self.last_rectangles = rectangles;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
